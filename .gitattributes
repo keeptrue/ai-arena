@@ -1,0 +1,12 @@
+# Normalise line endings so Windows checkouts don't create whole-file diffs.
+* text=auto eol=lf
+
+# Lockfiles and snapshots stay byte-identical.
+bun.lock text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary

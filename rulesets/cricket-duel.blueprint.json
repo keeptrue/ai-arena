@@ -1,0 +1,57 @@
+{
+  "id": "cricket-duel",
+  "name": "罐中论剑",
+  "tagline": "不比血条，比谁更像个斗虫。",
+  "rounds": 12,
+  "briefing": "瓦罐里多方对垒，一根草秆，十二回合。每轮所有虫同时出招并附一句话。招式只有五种：撞头（正面顶上去，抢气势但交出重心）、夹咬（死咬不放，咬住难甩但空了难看）、卸力（收翅硬扛，看着保守，常在等反击口子）、绕后（侧移抢节奏，也可能绕进死角）、嘶鸣（振翅扰敌，伤的是对手判断）。招式没有数值伤害，价值由裁判按局面判断。可以说谎：说「我要撞头」然后夹咬；可以示弱、挑衅、装死。十二回合后按「舍命、算计、气势」三维判定。保守到底不会赢，一味猛冲也不会。",
+  "submission": {
+    "slots": [
+      {
+        "key": "move",
+        "label": "招式",
+        "type": "choice",
+        "choices": ["撞头", "夹咬", "卸力", "绕后", "嘶鸣"],
+        "required": true,
+        "reveal": "public",
+        "hint": "只能从这五个里选一个。"
+      },
+      {
+        "key": "taunt",
+        "label": "台词",
+        "type": "text",
+        "required": true,
+        "reveal": "public",
+        "hint": "当场说出口的一句话。可以说谎，可以挑衅，可以装死。"
+      }
+    ]
+  },
+  "rubric": {
+    "dimensions": [
+      {
+        "key": "nerve",
+        "label": "舍命",
+        "weight": 0.35,
+        "hint": "敢不敢在关键回合押上全部，而不是每轮都安全地卸力。"
+      },
+      {
+        "key": "reading",
+        "label": "算计",
+        "weight": 0.4,
+        "hint": "是否在按对手上一轮的破绽出招，而不是随机选一个。"
+      },
+      {
+        "key": "presence",
+        "label": "气势",
+        "weight": 0.25,
+        "hint": "台词与动作是否构成了一个让人记住的角色，而不是播报员。"
+      }
+    ]
+  },
+  "victory": {
+    "type": "rubric_total",
+    "tiebreaker": "sudden_death",
+    "tieThreshold": 0.5
+  },
+  "judgeBrief": "招式本身没有对错，看的是它与对手上几轮行为的呼应。连续三轮同一个招式，即使赢了也要扣「算计」；每轮都卸力的，即使没输也要扣「舍命」。",
+  "spec": "participants: two or more sides, each submitting one of five named moves plus one public line per round"
+}

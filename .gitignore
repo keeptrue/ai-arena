@@ -1,0 +1,18 @@
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# runtime state — never commit
+# data/* (not data/) so the trailing negation can actually re-include .gitkeep;
+# git never descends into an ignored directory, so data/ + !data/.gitkeep is a no-op.
+data/*
+!data/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+
+.env
+.env.local
+.DS_Store

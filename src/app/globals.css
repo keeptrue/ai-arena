@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+/* ── tokens: dark is the default, light overrides via data-theme ────── */
+
+:root {
+  --ink-0: #08080a;
+  --ink-1: #0d0d11;
+  --ink-2: #121218;
+  --ink-3: #181820;
+  --line: #1f1f28;
+  --line-strong: #2e2e3a;
+  --fg: #e9e9f0;
+  --fg-dim: #9a9aab;
+  --fg-faint: #656575;
+  --jade: #37e0b0;
+  --amber: #ffab3d;
+  --blood: #ff5a5a;
+  --ghost: #8b9dff;
+
+  --glow-a: rgba(55, 224, 176, 0.07);
+  --glow-b: rgba(255, 171, 61, 0.05);
+  --panel-translucent: rgba(13, 13, 17, 0.92);
+  --shadow-panel: 0 1px 0 rgba(255, 255, 255, 0.02) inset;
+
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --ink-0: #f4f2ec;
+  --ink-1: #fffdf8;
+  --ink-2: #faf7ef;
+  --ink-3: #efebe0;
+  --line: #e3ded1;
+  --line-strong: #cfc8b6;
+  --fg: #1b1a17;
+  --fg-dim: #57534a;
+  --fg-faint: #8a8477;
+  --jade: #0b8a68;
+  --amber: #a8630f;
+  --blood: #c23a2c;
+  --ghost: #4553c9;
+
+  --glow-a: rgba(11, 138, 104, 0.07);
+  --glow-b: rgba(168, 99, 15, 0.06);
+  --panel-translucent: rgba(255, 253, 248, 0.9);
+  --shadow-panel: 0 1px 2px rgba(27, 26, 23, 0.04);
+
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-ink-0: var(--ink-0);
+  --color-ink-1: var(--ink-1);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-fg-dim: var(--fg-dim);
+  --color-fg-faint: var(--fg-faint);
+  --color-jade: var(--jade);
+  --color-amber: var(--amber);
+  --color-blood: var(--blood);
+  --color-ghost: var(--ghost);
+
+  --font-sans: ui-sans-serif, "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "Menlo", "Consolas", monospace;
+}
+
+@layer base {
+  html {
+    transition: color 160ms ease;
+  }
+  body {
+    background-color: var(--color-ink-0);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    background-image:
+      radial-gradient(900px 520px at 50% -10%, var(--glow-a), transparent 70%),
+      radial-gradient(700px 420px at 90% 10%, var(--glow-b), transparent 70%);
+    background-attachment: fixed;
+    transition: background-color 160ms ease, color 160ms ease;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--color-jade) 30%, transparent);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 999px;
+  }
+}
+
+@layer utilities {
+  .panel {
+    background-color: var(--panel-translucent);
+    border: 1px solid var(--color-line);
+    border-radius: 14px;
+    box-shadow: var(--shadow-panel);
+  }
+  .mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .label {
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--color-fg-faint);
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Motion only — no opacity keyframe, so frozen compositors still show full text. */
+@keyframes rise {
+  from {
+    transform: translateY(2px);
+  }
+  to {
+    transform: none;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/*
+ * Deliberately no `both`/`forwards`: if the compositor never advances (headless,
+ * frozen background tab), text must still be readable at its base opacity.
+ */
+.chunk {
+  animation: rise 240ms ease-out;
+}
+
+.live-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chunk,
+  .live-dot {
+    animation: none;
+  }
+}

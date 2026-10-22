@@ -1,0 +1,56 @@
+{
+  "id": "dark-auction",
+  "name": "暗标竞地",
+  "tagline": "五轮暗标，出价最高的未必是赢家。",
+  "rounds": 5,
+  "briefing": "一块城郊旧厂房地皮，多方竞标。每轮所有方同时提交一个报价（0–1000 万）与一段公开陈述。报价只有裁判看得到，陈述对所有人公开。共五轮，出价最高者中标地皮，但真正收益 = 700 万 − 出价 − 400 万开发成本；未中标者收益为 0。出价低于 300 万不可能中标，高于 700 万即便中标也是净亏。可以撒谎、可以承诺后违约、可以口头结盟再翻脸；不可以直接说出别人没公开的信息。最终由裁判按「算计、操控、兑现」三维判定谁打得最好——出价最高者不一定获胜，拿着 0 收益全身而退也可能更漂亮。",
+  "submission": {
+    "slots": [
+      {
+        "key": "bid",
+        "label": "报价",
+        "type": "number",
+        "required": true,
+        "reveal": "secret",
+        "hint": "单位：万元。0–1000 之间。这个数字只有裁判看得到。"
+      },
+      {
+        "key": "statement",
+        "label": "公开陈述",
+        "type": "text",
+        "required": true,
+        "reveal": "public",
+        "hint": "一到两句话，当场说给所有人听。可以虚张声势，也可以放烟雾弹。"
+      }
+    ]
+  },
+  "rubric": {
+    "dimensions": [
+      {
+        "key": "calculation",
+        "label": "算计",
+        "weight": 0.4,
+        "hint": "有没有算清「中标价 − 700 万 − 400 万」这笔账；有没有在关键轮次故意让出报价。"
+      },
+      {
+        "key": "manipulation",
+        "label": "操控",
+        "weight": 0.35,
+        "hint": "公开陈述是否真的改变了对手的出价，而不是只说了漂亮话。"
+      },
+      {
+        "key": "consistency",
+        "label": "兑现",
+        "weight": 0.25,
+        "hint": "说的和做的是否一致；若撒谎，这个谎有没有换来实际收益。"
+      }
+    ]
+  },
+  "victory": {
+    "type": "rubric_total",
+    "tiebreaker": "sudden_death",
+    "tieThreshold": 0.5
+  },
+  "judgeBrief": "重点关注每方报价与它自己公开陈述之间的关系：说「我只出到 350」却报了 520 的，要看这个谎言换来了什么。最终收益（700 − 出价 − 400，未中标为 0）是重要证据，但不是唯一依据。",
+  "spec": "participants: two or more sides, each submitting one secret numeric bid and one public statement per round"
+}
