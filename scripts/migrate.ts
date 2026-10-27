@@ -13,6 +13,6 @@ const { synced, errors } = await syncBuiltinRulesets();
 
 console.log(`providers : ${listProviders().length}`);
 console.log(`models    : ${listModels().length}`);
-console.log(`rulesets  : ${listRulesets().map((r) => `${r.slug}(${r.blueprint.rounds}轮)`).join(", ") || "none"}`);
+console.log(`rulesets  : ${listRulesets().map((r) => `${r.slug}(${r.blueprint.mode === "werewolf" || r.blueprint.mode === "coup" ? `${r.blueprint.seats}人` : `${r.blueprint.rounds}轮`})`).join(", ") || "none"}`);
 if (synced.length) console.log(`synced    : ${synced.join(", ")}`);
 for (const e of errors) console.error(`! ${e}`);

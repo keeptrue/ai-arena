@@ -7,14 +7,20 @@ import { nid } from "@/db/client";
 import {
   appendEvent,
   createMatch,
+  dropCheckpoint,
   ensureSeedData,
+  getMatch,
+  getMatchRoster,
   getModelRow,
   getRulesetById,
+  lastEventTs,
   listModels,
   listPromptOverrides,
   listProviders,
   listRulesets,
+  loadCheckpoint,
   nextSeq,
+  saveCheckpoint,
   saveJudgement,
   saveSubmission,
   setMatchStatus,
@@ -26,24 +32,57 @@ import { publish } from "@/lib/bus";
 import { parseBoardState, parseMarks } from "@/lib/board";
 import { getSecret } from "@/lib/secrets";
 import { callWithRetry } from "@/providers";
-import { parseBlueprint, teamLetters, validateSubmission } from "./blueprint";
+import {
+  DEFAULT_CALL_TIMEOUT_MS,
+  MAX_THINKING_CHARS,
+  MIN_CALL_TIMEOUT_MS,
+  MAX_CALL_TIMEOUT_MS,
+  REPEAT_LIMIT,
+  REPEAT_WINDOW,
+  STALL_MS,
+  callTimeoutFor,
+  failureMessage,
+  forfeitReason,
+  openCallWindow,
+  shouldRetryStall,
+  type CallCut,
+  type CallCutInfo,
+} from "./call-window";
+import {
+  FLUSH_BUDGET,
+  FLUSH_MAX_CHARS,
+  FLUSH_MAX_INTERVAL_MS,
+  FLUSH_MS,
+  flushIntervalFor,
+  openDeltaPump,
+} from "./pump";
+import { teamLetters, validateSubmission } from "./blueprint";
+import { parseAnyBlueprint } from "./game";
+import { startCoupMatch, recoverCoupMatch, interveneCoup, abortCoupMatch, coupLive } from "./coup/runtime";
+import { abortWerewolfMatch, interveneWerewolf, recoverWerewolfMatch, startWerewolfMatch, werewolfLive } from "./werewolf/runtime";
+import type { WerewolfRoleId } from "./werewolf/types";
 import { chooseJudge } from "./judge";
+import { applySettlement, outOfRange } from "./ledger";
 import { SubmissionStreamParser, repairJson } from "./parse";
 import { buildJudgePrompt, buildParticipantPrompt } from "./prompt";
 import { isPromptKey, type PromptOverrides } from "./prompt-templates";
-import { blindMapFor, budgetExhausted, createMatchState, reduce } from "./round";
+import { blindMapFor, budgetExhausted, createMatchState, recoverRound, reduce } from "./round";
 import { makeSeed, shuffle } from "./rng";
 import type {
   ArenaEvent,
+  BoardSpec,
   Effect,
   Intervention,
   JudgeVerdict,
   MatchState,
   ModelSnapshot,
   ParticipantState,
+  RecoverResult,
+  Settlement,
   Submission,
   TeamScoreLine,
   TeamState,
+  TokenUsage,
 } from "./types";
 
 /**
@@ -51,56 +90,6 @@ import type {
  * 0 = unlimited: the arena never imposes an input/output token ceiling.
  */
 const DEFAULT_BUDGET = { maxCalls: 200, maxTokens: 0 };
-
-/**
- * A round waits for everyone, so one chatty model can stall the whole table.
- * Every call gets a hard deadline; on timeout that seat forfeits the round.
- */
-const CALL_TIMEOUT_MS = Number(process.env.ARENA_CALL_TIMEOUT_MS ?? 180_000);
-/**
- * Small models can degrade into an endless monologue and never emit <<<SUBMIT>>>.
- * A plain length cap would punish legitimately long reasoning, so we look for the
- * actual failure signature: the same 60-character window repeating over and over.
- */
-const MAX_THINKING_CHARS = Number(process.env.ARENA_MAX_THINKING_CHARS ?? 300_000);
-/**
- * Time-based cutoff beats a character cap here: reasoning models legitimately burn
- * thousands of characters before answering, but a model that has spent this long
- * without even starting the submit block is not going to arrive.
- */
-const NO_SUBMIT_MS = Number(process.env.ARENA_NO_SUBMIT_MS ?? 150_000);
-const REPEAT_WINDOW = 60;
-const REPEAT_LIMIT = 6;
-/** Streaming granularity, not a content cap: past this many chunks the audience
- *  still gets every character, just in coarser blocks (see COARSE_FLUSH_CHARS). */
-const MAX_THINKING_CHUNKS = 400;
-const CHUNK_FLUSH_CHARS = 64;
-/** After MAX_THINKING_CHUNKS, coalesce this many characters per event instead of
- *  dropping the tail — a frozen live stream reads as "the match is stuck". */
-const COARSE_FLUSH_CHARS = Number(process.env.ARENA_COARSE_FLUSH_CHARS ?? 2_048);
-
-/**
- * Characters per streaming event. Fine-grained at first so the audience watches
- * the model think; once the chunk budget is spent, coalesce instead of going
- * silent. Never return Infinity: a tail still has to reach the screen.
- */
-export function thinkingFlushThreshold(emitted: number): number {
-  return emitted < MAX_THINKING_CHUNKS ? CHUNK_FLUSH_CHARS : COARSE_FLUSH_CHARS;
-}
-
-/** Why a participant turn ended without a submission. Exported for tests. */
-export function forfeitReason(input: {
-  runaway: boolean;
-  elapsedMs: number;
-  timeoutMs: number;
-  message: string;
-}): string {
-  const seconds = Math.round(input.elapsedMs / 1000);
-  if (input.runaway) return `thinking_runaway: ${seconds} 秒内没有开始提交，已截断`;
-  // The deadline AbortController is the only thing that fires this late.
-  if (input.elapsedMs >= input.timeoutMs - 1_000) return `call_timeout: ${seconds} 秒未返回，已中止`;
-  return `actor_failed: ${input.message}`;
-}
 
 const TEAM_PALETTE = [
   { name: "赤", color: "#ff6b52" },
@@ -113,6 +102,26 @@ const TEAM_PALETTE = [
   { name: "褐", color: "#c08a5a" },
 ];
 
+export {
+  DEFAULT_CALL_TIMEOUT_MS,
+  MAX_CALL_TIMEOUT_MS,
+  MIN_CALL_TIMEOUT_MS,
+  STALL_MS,
+  STALL_RETRY,
+  callTimeoutFor,
+  shouldRetryStall,
+  watchdogCut,
+  forfeitReason,
+} from "./call-window";
+export {
+  FLUSH_BUDGET,
+  FLUSH_MAX_CHARS,
+  FLUSH_MAX_INTERVAL_MS,
+  FLUSH_MS,
+  flushIntervalFor,
+  openDeltaPump,
+} from "./pump";
+
 export interface StartOptions {
   rulesetId?: string;
   seed?: string;
@@ -123,6 +132,16 @@ export interface StartOptions {
   /** Which model referees: a `models.id` from the judge pool. Omitted = auto. */
   judgeModelId?: string | null;
   budget?: { maxCalls: number; maxTokens: number };
+  /**
+   * Werewolf / coup table: one model per seat. The same model may hold more than
+   * one seat (a mirror table) — the launcher labels those seats instead of
+   * blocking them.
+   */
+  seats?: Array<{ modelId: string }>;
+  /** Nine-seat table: engine shuffle, manual roles, or judge deal. */
+  deal?: { mode: "engine" | "manual" | "judge"; roles?: WerewolfRoleId[] };
+  /** Coup: the audience-side narrator; omitted or empty keeps it off. */
+  commentaryModelId?: string | null;
 }
 
 interface Ctx {
@@ -135,11 +154,27 @@ interface Ctx {
   /** say/rule interventions, carried into every subsequent prompt. */
   said: Intervention[];
   warnedJudge: boolean;
+  /** Set once a checkpoint write fails, so the anomaly is logged once, not per turn. */
+  checkpointBroken: boolean;
+}
+
+/** What a restart needs: the reducer state plus the ctx-only bits. */
+interface RubricCheckpoint {
+  v: 1;
+  said: Intervention[];
+  warnedJudge: boolean;
+  state: MatchState;
 }
 
 // Next.js gives each route its own module graph; park live state on globalThis.
-const G = globalThis as unknown as { __arenaRuntime?: Map<string, Ctx>; __arenaBooted?: boolean };
+const G = globalThis as unknown as {
+  __arenaRuntime?: Map<string, Ctx>;
+  __arenaBooted?: boolean;
+  __arenaBoot?: Promise<void>;
+  __arenaRecovering?: Set<string>;
+};
 const contexts: Map<string, Ctx> = (G.__arenaRuntime ??= new Map<string, Ctx>());
+const recovering: Set<string> = (G.__arenaRecovering ??= new Set<string>());
 
 export function getContext(matchId: string): Ctx | undefined {
   return contexts.get(matchId);
@@ -205,8 +240,15 @@ function resolveJudge(
 
 export interface StartResult {
   matchId: string;
+  kind: "rubric" | "werewolf" | "coup";
   seed: string;
-  teams: Array<{ id: string; name: string; color: string; members: Array<{ seat: number; display: string }> }>;
+  teams?: Array<{
+    id: string;
+    name: string;
+    color: string;
+    members: Array<{ seat: number; display: string }>;
+  }>;
+  seats?: Array<{ seat: number; display: string; role?: WerewolfRoleId }>;
   judge: string | null;
 }
 
@@ -216,19 +258,43 @@ export async function startMatch(options: StartOptions = {}): Promise<StartResul
   const rulesets = listRulesets().filter((r) => r.enabled);
   const ruleset = options.rulesetId ? getRulesetById(options.rulesetId) : rulesets[0];
   if (!ruleset) throw new Error("没有可用的规则：先去 /rulesets 写一条，或启用内置规则");
-  const blueprint = parseBlueprint(ruleset.blueprint);
+  const blueprint = parseAnyBlueprint(ruleset.blueprint);
+  if (blueprint.mode === "coup") {
+    return startCoupMatch({
+      ruleset,
+      spec: blueprint,
+      seats: options.seats,
+      seed: options.seed,
+      budget: options.budget,
+      commentaryModelId: options.commentaryModelId,
+    });
+  }
+  if (blueprint.mode === "werewolf") {
+    return startWerewolfMatch({
+      ruleset,
+      spec: blueprint,
+      seats: options.seats,
+      deal: options.deal,
+      seed: options.seed,
+      judgeModelId: options.judgeModelId,
+      budget: options.budget,
+    });
+  }
   const seed = options.seed?.trim() || makeSeed();
 
   const keyed = keyedProviders();
   const usable = usableModels(keyed);
   const contenders = usable.filter((m) => m.inContenderPool);
-  if (contenders.length < 2) {
+  // An explicit roster may put one model on every seat (a mirror duel); only the
+  // random draw below needs two models in the pool.
+  const explicitRoster = !!options.teams && options.teams.length >= 2;
+  if (!explicitRoster && contenders.length < 2) {
     throw new Error("至少需要两个可用的选手模型：去 /setups 填 Key 并拉取模型，或启用本地演练体");
   }
 
   /* resolve roster */
   let teamSpecs: Array<{ name?: string; modelIds: string[] }>;
-  if (options.teams && options.teams.length >= 2) {
+  if (explicitRoster && options.teams) {
     teamSpecs = options.teams;
   } else {
     const sizes = options.teamSizes?.length ? options.teamSizes : [1, 1];
@@ -260,6 +326,18 @@ export async function startMatch(options: StartOptions = {}): Promise<StartResul
 
   const modelSnapshots = new Map<string, ModelSnapshot>();
   for (const t of teamSpecs) for (const id of t.modelIds) modelSnapshots.set(id, snapshotModel(id));
+
+  // A declared ledger addresses exactly two sides, one submission each. Anything else
+  // would fall back to judge arithmetic *and* silently zero the derived dimensions —
+  // refuse up front instead of producing a match with no scoreboard.
+  if (blueprint.board?.settle) {
+    const seats = teamSpecs.map((t) => t.modelIds.length);
+    if (teamSpecs.length !== 2 || seats.some((n) => n !== 1)) {
+      throw new Error(
+        `规则「${blueprint.name}」的账本按两方各 1 人结算，这局是 ${teamSpecs.length} 方（${seats.join("+")} 人）。换一条规则，或把阵容改成 1v1。`,
+      );
+    }
+  }
 
   const judgeModel = resolveJudge(
     [...modelSnapshots.values()],
@@ -346,6 +424,7 @@ export async function startMatch(options: StartOptions = {}): Promise<StartResul
     queue: [],
     said: [],
     warnedJudge: false,
+    checkpointBroken: false,
   };
   contexts.set(matchId, ctx);
 
@@ -353,6 +432,7 @@ export async function startMatch(options: StartOptions = {}): Promise<StartResul
 
   return {
     matchId,
+    kind: "rubric",
     seed,
     teams: teams.map((t) => ({
       id: t.id,
@@ -379,8 +459,35 @@ function apply(ctx: Ctx, action: Parameters<typeof reduce>[1]): void {
 
   const { state, effects } = reduce(ctx.state, action);
   ctx.state = state;
+  // Durability before dispatch: no seat may be called off a state that is not on
+  // disk, or a restart would let that seat submit twice.
+  persistCheckpoint(ctx);
 
   for (const effect of effects) dispatch(ctx, effect);
+}
+
+/** The rewind point for this match; dropped when the match ends. */
+function persistCheckpoint(ctx: Ctx): void {
+  try {
+    saveCheckpoint(ctx.id, "rubric", {
+      v: 1,
+      said: ctx.said,
+      warnedJudge: ctx.warnedJudge,
+      state: ctx.state,
+    } satisfies RubricCheckpoint);
+  } catch {
+    if (ctx.checkpointBroken) return;
+    ctx.checkpointBroken = true;
+    try {
+      emitNow(ctx, {
+        type: "anomaly",
+        ts: Date.now(),
+        payload: { code: "checkpoint_failed", message: "断点写入失败，重启后这一局无法续跑" },
+      });
+    } catch {
+      /* the log is broken too */
+    }
+  }
 }
 
 function dispatch(ctx: Ctx, effect: Effect): void {
@@ -406,7 +513,7 @@ function dispatch(ctx: Ctx, effect: Effect): void {
       void (async () => {
         await waitIfPaused(ctx);
         if (ctx.stop) return;
-        const verdict = await runJudge(ctx, effect.round, effect.sudden);
+        const verdict = await runJudge(ctx, effect.round, effect.sudden, effect.settlement ?? null);
         if (!verdict) {
           // Never fabricate a verdict. Bank what was actually earned — and if
           // nothing has been scored yet, declare no winner rather than team 0.
@@ -430,8 +537,14 @@ function dispatch(ctx: Ctx, effect: Effect): void {
 function finishNow(ctx: Ctx, winnerTeamId: string | null, reason: string): void {
   ctx.stop = true;
   setMatchStatus(ctx.id, "finished", { winnerTeamId, endReason: reason });
-  updateMatchUsage(ctx.id, ctx.state.budget.calls, ctx.state.budget.tokens);
+  updateMatchUsage(ctx.id, ctx.state.budget.calls, ctx.state.budget.tokens, ctx.state.budget.cachedTokens ?? 0);
   updateTeamTotals(ctx.id, ctx.state.teams);
+  // A finished match has nothing left to rewind to.
+  try {
+    dropCheckpoint(ctx.id);
+  } catch {
+    /* the row is harmless: recovery refuses a finished match anyway */
+  }
   setTimeout(() => contexts.delete(ctx.id), 10 * 60 * 1000);
 }
 
@@ -467,12 +580,40 @@ export function intervene(
     text?: string;
     teamId?: string;
     participantId?: string;
+    seat?: number;
     delta?: number;
   },
-): { ok: boolean; error?: string } {
+): { ok: boolean; error?: string; code?: string } {
+  const werewolf = interveneWerewolf(matchId, input);
+  if (werewolf) return werewolf;
+  const coup = interveneCoup(matchId, input);
+  if (coup) return coup;
   const ctx = contexts.get(matchId);
-  if (!ctx) return { ok: false, error: "对局不在运行中" };
-  if (ctx.stop) return { ok: false, error: "对局已结束" };
+  if (!ctx) return { ok: false, code: "not_running", error: "对局不在运行中" };
+  if (ctx.stop) return { ok: false, code: "finished", error: "对局已结束" };
+
+  // A recall is a state transition with a call attached, not a note for the DM log:
+  // push it through `apply` so the checkpoint lands before the seat is called again.
+  if (input.kind === "recall") {
+    const participantId = input.participantId;
+    const submission = participantId ? ctx.state.pending[participantId] : undefined;
+    if (!participantId || !submission || submission.status !== "forfeit") {
+      return { ok: false, code: "already_settled", error: "这个座位本轮没有可回滚的弃权" };
+    }
+    if (ctx.state.phase !== "collecting" && ctx.state.phase !== "sudden") {
+      return { ok: false, code: "phase_advanced", error: "本轮已经裁决，补叫会让结论倒流" };
+    }
+    if (ctx.state.budget.calls + 1 > ctx.state.budget.maxCalls) {
+      return { ok: false, code: "budget_exceeded", error: "调用预算不足，补叫会让这一局中止" };
+    }
+    emitNow(ctx, {
+      type: "dm.intervened",
+      ts: Date.now(),
+      payload: { kind: "recall", participantId },
+    });
+    apply(ctx, { kind: "recall", participantId });
+    return { ok: true };
+  }
 
   const intervention: Intervention = { id: nid("dm"), ts: Date.now(), ...input };
   emitNow(ctx, {
@@ -489,10 +630,18 @@ export function intervene(
       for (const wake of ctx.pauseWaiters.splice(0)) wake();
     }, 0);
   }
+  // Mirror pause/resume onto the state right away: a crash in this window must not
+  // silently un-pause the match on recovery.
+  if (input.kind === "pause" || input.kind === "resume") {
+    ctx.state = { ...ctx.state, paused: input.kind === "pause" };
+    persistCheckpoint(ctx);
+  }
   return { ok: true };
 }
 
 export function abortMatch(matchId: string, reason = "manual"): { ok: boolean } {
+  if (abortWerewolfMatch(matchId, reason)) return { ok: true };
+  if (abortCoupMatch(matchId, reason)) return { ok: true };
   const ctx = contexts.get(matchId);
   if (!ctx) {
     setMatchStatus(matchId, "aborted", { endReason: reason });
@@ -564,30 +713,27 @@ async function runParticipant(ctx: Ctx, participantId: string): Promise<void> {
   });
 
   const parser = new SubmissionStreamParser();
-  let buffer = "";
-  let emitted = 0;
-  const flush = (force = false) => {
-    if (!buffer) return;
-    const threshold = thinkingFlushThreshold(emitted);
-    if (!force && buffer.length < threshold) return;
-    const delta = buffer;
-    buffer = "";
-    emitted += 1;
+  // Cadence, not block size: the audience gets a delta every FLUSH_MS for as long as
+  // the model keeps writing, whether it writes 3 characters or 30 000.
+  const pump = openDeltaPump((delta, meta) => {
     emitNow(ctx, {
       type: "seat.thinking.delta",
       seat: participant.seat,
       teamId: participant.teamId,
       ts: Date.now(),
-      payload: { round, participantId, delta, coarse: emitted >= MAX_THINKING_CHUNKS },
+      payload: { round, participantId, delta, coarse: meta.backedOff },
     });
-  };
+  });
 
   let result;
-  const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
-  let runaway = false;
+  // Both bounds live on the call window: a total ceiling that only exists to cap
+  // billing, and a silence detector that is the real "this call is dead" signal.
+  const timeoutMs = callTimeoutFor(participant.model);
+  let callWindow = openCallWindow({ timeoutMs, stallMs: STALL_MS });
   let thinkingChars = 0;
   let nativeDump = "";
+  /** Content received by the *current* attempt. A retry is only free when this is 0. */
+  let attemptChars = 0;
 
   // Rolling shingle counter: catches loops without punishing length.
   const shingles = new Map<string, number>();
@@ -605,66 +751,98 @@ async function runParticipant(ctx: Ctx, participantId: string): Promise<void> {
   };
 
   const sink = (delta: { thinking?: string; text?: string }) => {
+    // Every chunk is evidence the model is still working; the stall timer resets here.
+    callWindow.touch();
     if (delta.thinking) {
       thinkingChars += delta.thinking.length;
+      attemptChars += delta.thinking.length;
       nativeDump += delta.thinking;
-      buffer += delta.thinking;
-      flush();
-      if (isLooping(delta.thinking)) runaway = true;
+      pump.push(delta.thinking);
+      if (isLooping(delta.thinking)) callWindow.abort("loop");
     }
     if (delta.text) {
       const out = parser.push(delta.text);
       if (out) {
         thinkingChars += out.length;
-        buffer += out;
-        flush();
-        if (isLooping(out)) runaway = true;
+        attemptChars += out.length;
+        pump.push(out);
+        if (isLooping(out)) callWindow.abort("loop");
       }
     }
-    if (!runaway && thinkingChars > MAX_THINKING_CHARS) runaway = true;
-    if (!runaway && !parser.sawSubmit && Date.now() - started > NO_SUBMIT_MS) runaway = true;
-    if (runaway) controller.abort();
+    if (MAX_THINKING_CHARS > 0 && thinkingChars > MAX_THINKING_CHARS) callWindow.abort("size");
   };
 
-  // A silent gateway stops calling the sink entirely, so the delta-driven check
-  // above can never fire. Poll the same deadline on a timer: a stalled stream is
-  // cut at NO_SUBMIT_MS, not left hanging until the hard timeout.
-  const watchdog = setInterval(() => {
-    if (runaway) return;
-    if (!parser.sawSubmit && Date.now() - started > NO_SUBMIT_MS) {
-      runaway = true;
-      controller.abort();
-    }
-  }, 1_000);
-
+  // A silence cut that produced literally nothing may be a dead gateway rather
+  // than a dead model: re-open once, on a fresh clock and a fresh AbortSignal.
+  let lastCut: CallCutInfo | null = null;
+  let stallRetries = 0;
   try {
-    result = await callWithRetry(
-      {
-        model: participant.model,
-        apiKey,
-        system: prompt.system,
-        messages: prompt.messages,
-        signal: controller.signal,
-      },
-      sink,
-    );
+    for (;;) {
+      const window = callWindow;
+      attemptChars = 0;
+      try {
+        result = await callWithRetry(
+          {
+            model: participant.model,
+            apiKey,
+            system: prompt.system,
+            messages: prompt.messages,
+            signal: window.signal,
+            // Bytes on the wire prove the connection is alive even when the model
+            // is still thinking and nothing printable has arrived yet.
+            onBeat: () => window.touch(),
+          },
+          sink,
+          // A transient 429 must not spend the model's thinking budget: new attempt, new clock.
+          () => window.rearm(),
+        );
+        break;
+      } catch (err) {
+        const cut = window.cut();
+        if (cut) {
+          lastCut = { cut, elapsedMs: window.elapsedMs(), idleMs: window.idleMs(), timeoutMs };
+        }
+        window.close();
+        if (!shouldRetryStall({ cut, receivedChars: attemptChars, retriesUsed: stallRetries })) {
+          throw err;
+        }
+        stallRetries += 1;
+        emitNow(ctx, {
+          type: "anomaly",
+          ts: Date.now(),
+          payload: {
+            round,
+            participantId,
+            code: "stall_retried",
+            message: `${Math.round(STALL_MS / 1000)} 秒没有收到任何内容，已重开一次`,
+          },
+        });
+        callWindow = openCallWindow({ timeoutMs, stallMs: STALL_MS });
+      }
+    }
   } catch (err) {
-    clearTimeout(deadline);
-    clearInterval(watchdog);
-    flush(true);
+    callWindow.close();
+    pump.stop();
     const elapsed = Date.now() - started;
     const message = err instanceof Error ? err.message : String(err);
     submit({
       ...base,
       status: "forfeit",
-      anomalies: [forfeitReason({ runaway, elapsedMs: elapsed, timeoutMs: CALL_TIMEOUT_MS, message })],
+      anomalies: [
+        forfeitReason({
+          cut: lastCut?.cut ?? callWindow.cut(),
+          elapsedMs: elapsed,
+          idleMs: lastCut?.idleMs ?? callWindow.idleMs(),
+          timeoutMs,
+          message,
+        }),
+      ],
       latencyMs: elapsed,
     });
     return;
   }
-  clearTimeout(deadline);
-  clearInterval(watchdog);
-  flush(true);
+  callWindow.close();
+  pump.stop();
 
   let fin = parser.finish();
   // Some gateways stream everything through the reasoning channel and leave the
@@ -708,6 +886,8 @@ async function runParticipant(ctx: Ctx, participantId: string): Promise<void> {
               content: `你上一次的提交有问题：\n${checked.errors.join("\n")}\n只输出修正后的 JSON，不要思考、不要解释。`,
             },
           ],
+          // The repair turn gets the same ceiling as the original call; never unbounded.
+          ...(Number.isFinite(timeoutMs) ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
         },
         () => {},
       );
@@ -751,16 +931,35 @@ async function runParticipant(ctx: Ctx, participantId: string): Promise<void> {
   });
 }
 
-function addUsage(
-  a: { promptTokens: number; completionTokens: number },
-  b: { promptTokens: number; completionTokens: number },
-) {
-  return { promptTokens: a.promptTokens + b.promptTokens, completionTokens: a.completionTokens + b.completionTokens };
+function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  return {
+    promptTokens: a.promptTokens + b.promptTokens,
+    completionTokens: a.completionTokens + b.completionTokens,
+    cachedPromptTokens: (a.cachedPromptTokens ?? 0) + (b.cachedPromptTokens ?? 0),
+    cacheWriteTokens: (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0),
+  };
 }
 
 /* ── judging ───────────────────────────────────────────────────────── */
 
-async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<JudgeVerdict | null> {
+/** Declared meters only, values untouched: used to compare the judge's copy with the ledger. */
+function rawMeterState(board: BoardSpec | undefined, raw: unknown): Record<string, number> {
+  if (!board || !raw || typeof raw !== "object") return {};
+  const source = raw as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  for (const meter of board.meters) {
+    const value = Number(source[meter.key]);
+    if (Number.isFinite(value)) out[meter.key] = value;
+  }
+  return out;
+}
+
+async function runJudge(
+  ctx: Ctx,
+  round: number,
+  sudden: boolean,
+  settlement: Settlement | null,
+): Promise<JudgeVerdict | null> {
   const judgeModel = ctx.state.judgeModel;
   if (!judgeModel) return null;
   const apiKey = getSecret(judgeModel.providerId);
@@ -787,49 +986,90 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
     state: ctx.state,
     blindMap,
     sudden,
+    settlement,
     templates: promptOverrides(),
   });
-  let buffer = "";
   let full = "";
+  // The referee's reasoning is a live stream too: same cadence contract as the seats.
+  const pump = openDeltaPump((delta) => {
+    emitNow(ctx, { type: "judge.thinking.delta", ts: Date.now(), payload: { round, delta } });
+  });
+  const judgeTimeoutMs = callTimeoutFor(judgeModel);
+  // An AbortError reads the same whichever bound fired, so remember which one did.
+  let lastCut: CallCutInfo | null = null;
+
+  const callJudge = async (
+    messages: Array<{ role: "user" | "assistant"; content: string }>,
+    temperature?: number,
+  ) => {
+    let stallRetries = 0;
+    for (;;) {
+      // A fresh window per attempt: a spent ceiling must not kill the retry, and a
+      // referee that keeps talking is never cut for being slow.
+      const callWindow = openCallWindow({ timeoutMs: judgeTimeoutMs, stallMs: STALL_MS });
+      /** Content received by this attempt; a silence retry is only free when 0. */
+      let attemptChars = 0;
+      try {
+        return await callWithRetry(
+          {
+            model: temperature === undefined ? judgeModel : { ...judgeModel, temperature },
+            apiKey,
+            system: prompt.system,
+            messages,
+            signal: callWindow.signal,
+            json: true,
+            onBeat: () => callWindow.touch(),
+          },
+          (delta) => {
+            callWindow.touch();
+            if (delta.thinking) {
+              attemptChars += delta.thinking.length;
+              pump.push(delta.thinking);
+              full += delta.thinking;
+            }
+            if (delta.text) {
+              attemptChars += delta.text.length;
+              pump.push(delta.text);
+              full += delta.text;
+            }
+          },
+          () => callWindow.rearm(),
+        );
+      } catch (err) {
+        const cut = callWindow.cut();
+        if (cut) {
+          lastCut = {
+            cut,
+            elapsedMs: callWindow.elapsedMs(),
+            idleMs: callWindow.idleMs(),
+            timeoutMs: judgeTimeoutMs,
+          };
+        }
+        if (shouldRetryStall({ cut, receivedChars: attemptChars, retriesUsed: stallRetries })) {
+          stallRetries += 1;
+          emitNow(ctx, {
+            type: "anomaly",
+            ts: Date.now(),
+            payload: {
+              round,
+              code: "stall_retried",
+              message: `裁判 ${Math.round(STALL_MS / 1000)} 秒没有收到任何内容，已重开一次`,
+            },
+          });
+          continue;
+        }
+        throw err;
+      } finally {
+        callWindow.close();
+      }
+    }
+  };
 
   try {
-    const callJudge = (messages: Array<{ role: "user" | "assistant"; content: string }>, temperature?: number) =>
-      callWithRetry(
-        {
-          model: temperature === undefined ? judgeModel : { ...judgeModel, temperature },
-          apiKey,
-          system: prompt.system,
-          messages,
-          // A fresh deadline per attempt; a spent one must not kill the retry.
-          signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-          json: true,
-        },
-        (delta) => {
-          if (delta.thinking) {
-            buffer += delta.thinking;
-            full += delta.thinking;
-          }
-          if (delta.text) {
-            buffer += delta.text;
-            full += delta.text;
-          }
-          if (buffer.length >= 60) {
-            const chunk = buffer;
-            buffer = "";
-            emitNow(ctx, {
-              type: "judge.thinking.delta",
-              ts: Date.now(),
-              payload: { round, delta: chunk },
-            });
-          }
-        },
-      );
-
     let result = await callJudge(prompt.messages);
-    if (buffer) {
-      emitNow(ctx, { type: "judge.thinking.delta", ts: Date.now(), payload: { round, delta: buffer } });
-      buffer = "";
-    }
+    // Ship the tail before parsing: the audience should see the reasoning that
+    // produced the verdict, not a truncated feed.
+    pump.drain();
 
     const tryParse = (text: string) => JSON.parse(repairJson(text)) as {
       scores?: Record<string, Record<string, number | string>>;
@@ -867,10 +1107,7 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
         ],
         0,
       );
-      if (buffer) {
-        emitNow(ctx, { type: "judge.thinking.delta", ts: Date.now(), payload: { round, delta: buffer } });
-        buffer = "";
-      }
+      pump.drain();
       result = repair;
       parsed = tryParse(repair.text?.trim() ? repair.text : full);
     }
@@ -878,7 +1115,7 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
     const letters = teamLetters(ctx.state.teams.length);
     const board = ctx.state.blueprint.board;
     const boardIssues: Array<{ code: string; detail?: string }> = [];
-    const scores: TeamScoreLine[] = [];
+    const judgeScores: TeamScoreLine[] = [];
     if (!sudden) {
       for (const letter of letters) {
         const teamId = blindMap[letter];
@@ -890,9 +1127,13 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
           dims[dim.key] = Number.isFinite(value) ? Math.max(0, Math.min(10, value)) : 0;
           weighted += dims[dim.key] * dim.weight;
         }
-        const read = parseBoardState(board, parsed.state?.[letter]);
+        // A ledger board's numbers are the engine's; keep the judge's raw copy only
+        // to compare against, so clamping it first would manufacture a false conflict.
+        const read = settlement
+          ? { state: rawMeterState(board, parsed.state?.[letter]), issues: [] as Array<{ code: string; detail?: string }> }
+          : parseBoardState(board, parsed.state?.[letter]);
         boardIssues.push(...read.issues);
-        scores.push({
+        judgeScores.push({
           teamId,
           dimensions: dims,
           weighted: Number(weighted.toFixed(3)),
@@ -900,6 +1141,42 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
           ...(Object.keys(read.state).length ? { state: read.state } : {}),
         });
       }
+    }
+
+    // The ledger outranks the judge on everything mechanical: absolute readings and
+    // any dimension the ruleset derived. What the judge wrote stays in `notes`.
+    const merged = applySettlement({
+      settlement,
+      board,
+      dimensions: ctx.state.blueprint.rubric.dimensions,
+      scores: judgeScores,
+    });
+    const scores = merged.scores;
+    if (merged.corrections.length > 0) {
+      emitNow(ctx, {
+        type: "anomaly",
+        ts: Date.now(),
+        payload: {
+          round,
+          code: "board_mismatch",
+          message: merged.corrections
+            .slice(0, 6)
+            .map((c) => `${c.teamId}.${c.field}: judge ${c.judge ?? "—"} → ledger ${c.engine}`)
+            .join("; "),
+        },
+      });
+    }
+    const outside = outOfRange(board, settlement);
+    if (outside.length > 0) {
+      emitNow(ctx, {
+        type: "anomaly",
+        ts: Date.now(),
+        payload: {
+          round,
+          code: "board_out_of_range",
+          message: outside.map((o) => `${o.meter} ${o.value} 越界 ${o.limit}`).join("; "),
+        },
+      });
     }
 
     const parsedMarks = sudden ? { marks: [], issues: [] } : parseMarks(board, parsed.marks);
@@ -929,10 +1206,17 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
       blindMap,
       scores,
       verdict: typeof parsed.verdict === "string" ? parsed.verdict : "",
-      publicSummary: typeof parsed.publicSummary === "string" ? parsed.publicSummary : parsed.verdict ?? "",
+      // A settled round publishes the engine's ledger line: it is keyed by team name,
+      // so the audience never has to translate this round's letters.
+      publicSummary: settlement
+        ? settlement.summary
+        : typeof parsed.publicSummary === "string"
+          ? parsed.publicSummary
+          : parsed.verdict ?? "",
       judgeModel,
       usage: result.usage,
       ...(board?.marks ? { marks: parsedMarks.marks } : {}),
+      settlement,
       suddenWinnerTeamId: sudden
         ? (() => {
             const letter = (parsed.winner ?? "").trim().toUpperCase();
@@ -962,25 +1246,143 @@ async function runJudge(ctx: Ctx, round: number, sudden: boolean): Promise<Judge
       payload: {
         round,
         code: "judge_failed",
-        message: err instanceof Error ? err.message : String(err),
+        message: failureMessage(lastCut, err),
       },
     });
     return null;
+  } finally {
+    pump.stop();
+  }
+}
+
+/* ── crash recovery ────────────────────────────────────────────────── */
+
+/** Is a live loop driving this match right now, in either genre? */
+export function isLive(matchId: string): boolean {
+  if (werewolfLive(matchId)) return true;
+  if (coupLive(matchId)) return true;
+  const ctx = contexts.get(matchId);
+  return !!ctx && !ctx.stop;
+}
+
+/**
+ * Rebuild a match from its checkpoint and re-issue only what it still owes.
+ * Never called automatically: resuming spends real model calls, so the operator
+ * asks for it.
+ */
+export function recoverMatch(matchId: string): RecoverResult {
+  const match = getMatch(matchId);
+  if (!match) return { ok: false, code: "not_found", error: "对局不存在" };
+  if (match.status === "finished" || match.status === "aborted" || match.status === "failed") {
+    return { ok: false, code: "finished", error: "对局已结束" };
+  }
+  if (match.kind === "werewolf") return recoverWerewolfMatch(matchId);
+  if (match.kind === "coup") return recoverCoupMatch(matchId);
+  return recoverRubricMatch(matchId);
+}
+
+function recoverRubricMatch(matchId: string): RecoverResult {
+  const live = contexts.get(matchId);
+  if (live && !live.stop) return { ok: true, already: true };
+  if (live?.stop) return { ok: false, code: "finished", error: "对局已结束" };
+  if (recovering.has(matchId)) return { ok: false, code: "busy", error: "恢复正在进行中" };
+
+  recovering.add(matchId);
+  try {
+    const checkpoint = loadCheckpoint(matchId);
+    if (!checkpoint || checkpoint.kind !== "rubric") {
+      return { ok: false, code: "no_checkpoint", error: "这一局没有断点，无法续跑" };
+    }
+    const payload = checkpoint.payload as Partial<RubricCheckpoint> | null;
+    const state = payload?.state;
+    if (!state || state.matchId !== matchId || !Array.isArray(state.participants)) {
+      return { ok: false, code: "corrupt", error: "断点已损坏，无法续跑" };
+    }
+
+    // The checkpoint can already be terminal if the process died between the final
+    // verdict and the status write. Settle it instead of resurrecting the match.
+    if (state.phase === "done") {
+      setMatchStatus(matchId, "finished", {
+        winnerTeamId: state.winnerTeamId,
+        endReason: state.endReason ?? "recovered_done",
+      });
+      updateMatchUsage(matchId, state.budget.calls, state.budget.tokens, state.budget.cachedTokens ?? 0);
+      updateTeamTotals(matchId, state.teams);
+      dropCheckpoint(matchId);
+      return { ok: false, code: "finished", error: "对局已结束" };
+    }
+    if (state.phase === "idle") {
+      return { ok: false, code: "corrupt", error: "断点停在开局前，无法续跑" };
+    }
+
+    const { state: next, effects } = recoverRound(state);
+    const ctx: Ctx = {
+      id: matchId,
+      state: next,
+      seq: nextSeq(matchId),
+      stop: false,
+      pauseWaiters: [],
+      queue: [],
+      said: payload?.said ?? [],
+      warnedJudge: payload?.warnedJudge === true,
+      checkpointBroken: false,
+    };
+    contexts.set(matchId, ctx);
+    setMatchStatus(matchId, "running");
+    updateMatchUsage(matchId, next.budget.calls, next.budget.tokens, next.budget.cachedTokens ?? 0);
+
+    const owed = effects.flatMap((effect) =>
+      effect.kind === "call_participants" ? effect.ids : [],
+    );
+    const gapMs = Math.max(0, Date.now() - (lastEventTs(matchId) ?? Date.now()));
+    emitNow(ctx, {
+      type: "match.recovered",
+      ts: Date.now(),
+      payload: { kind: "rubric", round: next.round, phase: next.phase, paused: next.paused, owed, gapMs },
+    });
+    persistCheckpoint(ctx);
+    for (const effect of effects) dispatch(ctx, effect);
+
+    return { ok: true, resumed: true, day: next.round, phase: next.phase, owed };
+  } catch (err) {
+    return { ok: false, code: "corrupt", error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    recovering.delete(matchId);
   }
 }
 
 /* ── boot ──────────────────────────────────────────────────────────── */
 
-export function ensureRuntime(): void {
-  if (G.__arenaBooted) return;
-  G.__arenaBooted = true;
-  void import("@/db/repo").then((m) => {
+/**
+ * Seed, migrate and sweep orphan rows. Parked on globalThis because Next gives each
+ * route its own module graph: two routes must share one boot, not run two sweeps.
+ */
+function bootRuntime(): Promise<void> {
+  if (G.__arenaBoot) return G.__arenaBoot;
+  G.__arenaBoot = import("@/db/repo").then((m) => {
     try {
       m.ensureSeedData();
-      m.markOrphansInterrupted();
+      // Never bury a match that is already being resumed.
+      m.markOrphansInterrupted((id) => isLive(id));
       void import("@/lib/rulesets").then((r) => r.syncBuiltinRulesets()).catch(() => {});
     } catch {
       /* routes will surface db problems */
     }
   });
+  return G.__arenaBoot;
+}
+
+export function ensureRuntime(): void {
+  if (G.__arenaBooted) return;
+  G.__arenaBooted = true;
+  void bootRuntime();
+}
+
+/**
+ * Recovery has to wait for the sweep: otherwise the boot's `markOrphansInterrupted`
+ * can land *after* the match was restarted and write `interrupted` over `running`.
+ */
+export async function whenBooted(): Promise<void> {
+  ensureRuntime();
+  await bootRuntime();
 }

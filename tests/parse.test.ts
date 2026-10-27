@@ -70,3 +70,70 @@ describe("submission protocol", () => {
     expect(parseSubmitPayload("[1,2,3]").content).toBeNull();
   });
 });
+
+describe("structured note field", () => {
+  test("a note inside the submit JSON is the audience note even without a THINK draft", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    p.push('<<<SUBMIT>>>\n{"note":"写给观众","target":3}');
+    const fin = p.finish();
+    expect(fin.thinking).toBe("写给观众");
+    expect(fin.content).toEqual({ note: "写给观众", target: 3 });
+    expect(fin.anomalies).toEqual([]);
+  });
+
+  test("the JSON note wins over a live THINK draft", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    p.push('<<<THINK>>>\n草稿\n<<<SUBMIT>>>\n{"note":"正式旁白","target":3}');
+    expect(p.finish().thinking).toBe("正式旁白");
+  });
+
+  test("a legacy THINK draft still works when the JSON omits note", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    p.push('<<<THINK>>>\n旧旁白\n<<<SUBMIT>>>\n{"target":3}');
+    const fin = p.finish();
+    expect(fin.thinking).toBe("旧旁白");
+    expect(fin.anomalies).not.toContain("missing_note");
+  });
+
+  test("missing note is flagged when the payload has none", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    p.push('<<<SUBMIT>>>\n{"target":3}');
+    const fin = p.finish();
+    expect(fin.thinking).toBe("");
+    expect(fin.anomalies).toContain("missing_note");
+  });
+
+  test("the rubric parser leaves a slot named note alone", () => {
+    const p = new SubmissionStreamParser();
+    p.push('<<<SUBMIT>>>\n{"note":"slot","bid":3}');
+    const fin = p.finish();
+    expect(fin.thinking).toBe("");
+    expect(fin.content?.note).toBe("slot");
+  });
+});
+
+describe("the note field streams while the payload is still arriving", () => {
+  test("a note-only payload still feeds the live stream", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    let out = "";
+    out += p.push('<<<SUBMIT>>>\n{"note":"第一句');
+    out += p.push('，第二句","target":3}');
+    expect(out).toBe("第一句，第二句");
+    expect(p.finish().thinking).toBe("第一句，第二句");
+  });
+
+  test("escaped quotes are decoded instead of ending the note", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    const out = p.push('<<<SUBMIT>>>\n{"note":"他说\\"好\\"","target":3}');
+    expect(out).toBe('他说"好"');
+  });
+
+  test("a THINK draft is not duplicated by the note field", () => {
+    const p = new SubmissionStreamParser({ noteField: true });
+    let out = "";
+    for (const ch of '<<<THINK>>>\n草稿\n<<<SUBMIT>>>\n{"note":"正式旁白","target":3}') out += p.push(ch);
+    expect(out).toContain("草稿");
+    expect(out).not.toContain("正式旁白");
+    expect(p.finish().thinking).toBe("正式旁白");
+  });
+});

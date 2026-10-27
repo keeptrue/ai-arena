@@ -1,0 +1,54 @@
+{
+  "mode": "werewolf",
+  "id": "werewolf-nine",
+  "name": "预女猎九人局",
+  "tagline": "三狼三民三神，无警长，屠边定胜负。",
+  "seats": 9,
+  "briefing": "三狼、三民、预言家/女巫/猎人各一，无警长。好人放逐全部狼人获胜；狼人杀死全部神职或全部村民获胜。夜晚顺序：狼人先按座位低语、给出倾向刀口，再投一次定刀（可以改票；可自刀、可空刀；票多者执行，平票由种子决定）→ 预言家查验一名存活玩家，只知好人/狼人 → 女巫得知刀口后选择解药、毒药或不用，解药毒药各一瓶且同夜最多用一瓶，首夜可自救、之后不能，毒药不能毒自己。天亮只公布出局座位，不公布死因。首夜出局者留遗言，之后夜间出局不发言；猎人被狼刀或被放逐可开枪，被毒不能，枪下亡魂无遗言。白天存活者顺时针发言，首日从1号位起，之后从昨夜座位号最小的死者下家起，平安夜从上一日最后发言者下家起。全体投票可弃票，最高票放逐；平票者PK发言后由非PK存活者重投，只能投PK台上或弃票，再平票无人出局。狼人可在自己发言时自爆，翻牌出局、当天立即结束且无投票，自爆者不留遗言。同一批死亡同时满足双方条件时好人优先。最多8天。",
+  "roles": [
+    { "id": "wolf", "label": "狼人", "camp": "wolf", "count": 3 },
+    { "id": "villager", "label": "村民", "camp": "good", "count": 3 },
+    { "id": "seer", "label": "预言家", "camp": "good", "count": 1 },
+    { "id": "witch", "label": "女巫", "camp": "good", "count": 1 },
+    { "id": "hunter", "label": "猎人", "camp": "good", "count": 1 }
+  ],
+  "rules": {
+    "seerResult": "camp",
+    "witch": {
+      "antidote": 1,
+      "poison": 1,
+      "onePerNight": true,
+      "selfSave": "first_night",
+      "poisonSelf": false,
+      "seeKillAfterAntidote": true
+    },
+    "hunter": { "shootOn": ["wolf", "vote"], "poisonBlocks": true },
+    "wolf": {
+      "allowEmptyKill": true,
+      "allowSelfKill": true,
+      "decision": "plurality",
+      "tieBreak": "seed",
+      "chat": "sequential"
+    },
+    "day": {
+      "speech": "clockwise",
+      "start": "after_death",
+      "vote": "plurality",
+      "tie": "pk",
+      "pkVoters": "non_candidates",
+      "lastWords": ["night1", "daytime"],
+      "selfDestruct": "own_speech",
+      "selfDestructLastWords": false,
+      "shotLastWords": false
+    },
+    "maxDays": 8
+  },
+  "review": {
+    "enabled": true,
+    "selfWeight": 0,
+    "judgeVotes": 2,
+    "trim": true,
+    "minBallots": 4,
+    "weights": { "read": 0.35, "voice": 0.3, "craft": 0.25, "poise": 0.1 }
+  }
+}

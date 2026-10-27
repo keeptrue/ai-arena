@@ -34,6 +34,7 @@ interface Model {
   supportsReasoning: boolean;
   reasoningEffort: string | null;
   thinkingBudget: number | null;
+  callTimeoutMs: number | null;
   reasoningStyle: string | null;
   card: ModelCard | null;
   inContenderPool: boolean;
@@ -351,7 +352,7 @@ export function SetupEditor() {
       <section>
         <SectionHead
           title="模型池"
-          hint={`选手池 ${contenderCount} 个，裁判池 ${judgeCount} 个。随机配对只从选手池取；开局页可以从裁判池里指定裁判，默认自动优先挑与选手不同接入方的。思考强度按模型单独配置，来源是 models.dev 的能力目录。`}
+          hint={`选手池 ${contenderCount} 个，裁判池 ${judgeCount} 个。随机配对只从选手池取；开局页可以从裁判池里指定裁判，默认自动优先挑与选手不同接入方的（九人局里裁判也可以就是桌上某个模型）。思考强度按模型单独配置，来源是 models.dev 的能力目录。`}
         />
         <div className="space-y-3">
           {grouped.map(({ provider, models }) =>
@@ -484,6 +485,35 @@ function ReasoningControls({
           className="mono w-16 rounded border border-line bg-ink-1 px-1.5 py-1 text-[11px] outline-none placeholder:text-fg-faint focus:border-jade/40"
         />
       )}
+      <input
+        key={`${model.id}-timeout-${model.callTimeoutMs ?? "global"}`}
+        type="number"
+        defaultValue={model.callTimeoutMs ? Math.round(model.callTimeoutMs / 60_000) : ""}
+        min={1}
+        max={120}
+        placeholder="时限"
+        title="单次调用总时限（分钟）；留空沿用全局默认"
+        onBlur={(e) => {
+          const raw = e.target.value.trim();
+          const show = (ms: number | null) => {
+            e.target.value = ms ? String(Math.round(ms / 60_000)) : "";
+          };
+          if (raw === "") {
+            if (model.callTimeoutMs) onPatch({ callTimeoutMs: null });
+            else show(null);
+            return;
+          }
+          const minutes = Math.floor(Number(raw));
+          const next = minutes * 60_000;
+          if (!Number.isFinite(next) || next < 60_000 || next > 7_200_000) {
+            show(model.callTimeoutMs ?? null);
+            return;
+          }
+          if (next === model.callTimeoutMs) return;
+          onPatch({ callTimeoutMs: next });
+        }}
+        className="mono w-16 rounded border border-line bg-ink-1 px-1.5 py-1 text-[11px] outline-none placeholder:text-fg-faint focus:border-jade/40"
+      />
       <button
         onClick={onCalibrate}
         disabled={busy || model.providerKind === "mock"}

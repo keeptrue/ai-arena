@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
-import type { BoardSpec } from "@/engine/types";
-import { StateChips } from "./arena-board";
+import { memo, useState } from "react";
+import type { BoardSpec, Settlement } from "@/engine/types";
+import { ReadingChips, ScoreChips } from "./arena-board";
 import { EffortChip, ModelMetaLine, SlotRows, ThinkingBody, ThinkingCount } from "./arena-blocks";
 
 export interface SlotDef {
@@ -19,20 +19,26 @@ export interface MemberView {
   display: string;
   provider: string;
   modelId: string;
-  /** Provider protocol, temperature and output ceiling, read from the frozen snapshot. */
+  /** Provider protocol, temperature and call ceiling, read from the frozen snapshot. */
   kind?: string | null;
   temperature?: number | null;
   thinkingBudget?: number | null;
+  /** Per-model call ceiling in ms; null = inherit the runtime default (not shown). */
+  callTimeoutMs?: number | null;
   /** Configured thinking strength, if any; shown so the audience knows the dial. */
   reasoning?: string | null;
   status: "idle" | "thinking" | "ready" | "forfeit";
-  thinking: string[];
+  /** Accumulated live text: one string, appended per delta, never rebuilt. */
+  thinking: string;
   thinkingDone: boolean;
   content: Record<string, unknown> | null;
   usage?: { promptTokens: number; completionTokens: number } | null;
   latencyMs?: number | null;
   forfeitReason?: string | null;
 }
+
+/** Identity-only projection of the roster: stable across live deltas. */
+export type TeamIndex = Record<string, { name: string; color: string }>;
 
 export interface TeamView {
   id: string;
@@ -73,22 +79,32 @@ export interface RoundView {
     judge: string;
     marks?: number[];
     suddenWinnerTeamId?: string | null;
+    /** "A" | "B" → teamId for *this* round; needed to translate legacy summaries. */
+    blindMap?: Record<string, string>;
   } | null;
+  /** Engine-settled ledger for this round (or a repaired one). */
+  settlement?: Settlement | null;
   /** Judge's own stream for this round, kept so the audience can audit a verdict. */
   judgeThinking: string;
   teamScores: Record<string, number>;
 }
 
-export function MemberCard({
+export const MemberCard = memo(function MemberCard({
   member,
   slots,
   round,
   color,
+  live = true,
+  onRecall,
 }: {
   member: MemberView;
   slots: SlotDef[];
   round: number;
   color: string;
+  /** A dead process has no seat thinking: never animate a thought nobody writes. */
+  live?: boolean;
+  /** Re-open this seat after a cut that produced nothing; absent when illegal. */
+  onRecall?: (participantId: string) => void;
 }) {
   const forfeited = member.status === "forfeit";
   const secretCount = slots.filter((s) => s.reveal === "secret").length;
@@ -98,7 +114,9 @@ export function MemberCard({
     : member.content
       ? `${entryCount} 项${secretCount ? ` · ${secretCount} 暗项` : ""}`
       : member.status === "thinking"
-        ? `第 ${round} 轮推演中`
+        ? live
+          ? `第 ${round} 轮推演中`
+          : "已中断"
         : "等待出招";
 
   return (
@@ -137,15 +155,26 @@ export function MemberCard({
         <section className="rounded-md border border-line/70 bg-ink-0/35">
           <header className="flex items-center justify-between gap-2 px-2.5 pb-1 pt-2">
             <span className="label">思考</span>
-            <ThinkingCount member={member} />
+            <ThinkingCount
+              chars={member.thinking.length}
+              status={member.status}
+              done={member.thinkingDone}
+              live={live}
+            />
           </header>
           <div className="px-2.5 pb-2.5">
             <ThinkingBody
-              text={member.thinking.join("")}
+              text={member.thinking}
               done={member.thinkingDone}
               autoScroll={member.status === "thinking"}
               placeholder={
-                forfeited ? "本轮思考中断" : member.status === "thinking" ? "正在写：为什么这么选…" : "尚未开口"
+                forfeited
+                  ? "本轮思考中断"
+                  : member.status === "thinking"
+                    ? live
+                      ? "正在写：为什么这么选…"
+                      : "进程已中断"
+                    : "尚未开口"
               }
             />
           </div>
@@ -162,12 +191,24 @@ export function MemberCard({
           </header>
           <div className="px-2.5 pb-2">
             {forfeited ? (
-              <p
-                className="truncate py-1 text-[11px] text-blood"
-                title={member.forfeitReason ?? "本轮弃权"}
-              >
-                本轮弃权{member.forfeitReason ? ` · ${member.forfeitReason}` : ""}
-              </p>
+              <div className="flex items-center gap-1.5 py-1">
+                <p
+                  className="min-w-0 flex-1 truncate text-[11px] text-blood"
+                  title={member.forfeitReason ?? "本轮弃权"}
+                >
+                  本轮弃权{member.forfeitReason ? ` · ${member.forfeitReason}` : ""}
+                </p>
+                {onRecall && (
+                  <button
+                    type="button"
+                    onClick={() => onRecall(member.id)}
+                    title="本轮还没裁决：可以重叫它一次，弃权计数会一并回滚"
+                    className="shrink-0 rounded border border-amber/40 bg-amber/10 px-1.5 py-[2px] text-[10px] text-amber transition hover:bg-amber/15"
+                  >
+                    重叫
+                  </button>
+                )}
+              </div>
             ) : member.content ? (
               <SlotRows slots={slots} content={member.content} />
             ) : (
@@ -178,7 +219,7 @@ export function MemberCard({
       </div>
     </div>
   );
-}
+});
 
 function StatusDot({ status }: { status: MemberView["status"] }) {
   const map = {
@@ -191,14 +232,18 @@ function StatusDot({ status }: { status: MemberView["status"] }) {
   return <span className={`mono text-[10px] ${s.cls}`}>{s.text}</span>;
 }
 
-export function TeamColumn({
+export const TeamColumn = memo(function TeamColumn({
   team,
   slots,
   round,
+  live = true,
+  onRecall,
 }: {
   team: TeamView;
   slots: SlotDef[];
   round: number;
+  live?: boolean;
+  onRecall?: (participantId: string) => void;
 }) {
   return (
     <section className="panel flex min-w-0 flex-col overflow-hidden">
@@ -219,41 +264,155 @@ export function TeamColumn({
       </header>
       <div className="flex flex-1 flex-col gap-2 p-2.5">
         {team.members.map((m) => (
-          <MemberCard key={m.id} member={m} slots={slots} round={round} color={team.color} />
+          <MemberCard
+            key={m.id}
+            member={m}
+            slots={slots}
+            round={round}
+            color={team.color}
+            live={live}
+            onRecall={onRecall}
+          />
         ))}
       </div>
     </section>
   );
+});
+
+/**
+ * Older rounds keep the judge's letter-based summary. Translate it for the
+ * audience: the blind map is per round, so this is the only correct reading.
+ */
+export function translateLetters(
+  text: string,
+  blindMap: Record<string, string> | undefined,
+  nameOf: (teamId: string) => string,
+): string {
+  if (!blindMap) return text;
+  return text.replace(/(?<![A-Za-z0-9])[A-H](?![A-Za-z0-9])/g, (letter) => {
+    const teamId = blindMap[letter];
+    return teamId ? nameOf(teamId) : letter;
+  });
 }
 
-export function RoundCard({
+/** Who played what, and what it cost. One line per side, straight from the ledger. */
+function DuelRows({
+  board,
+  settlement,
+  nameOf,
+  colorOf,
+}: {
+  board?: BoardSpec | null;
+  settlement: Settlement;
+  nameOf: (teamId: string) => string;
+  colorOf: (teamId: string) => string;
+}) {
+  const meters = board?.meters ?? [];
+  const readout = meters
+    .filter((m) => m.kind !== "count")
+    .map((meter) => ({
+      meter,
+      parts: settlement.sides.map((side) => `${nameOf(side.teamId)} ${fmtMeter(side.state[meter.key] ?? 0)}`),
+    }));
+
+  return (
+    <div className="mb-2.5 rounded-md border border-line/70 bg-ink-0/35 px-2.5 py-2">
+      <div className="space-y-1">
+        {settlement.sides.map((side) => {
+          const deltas = meters
+            .map((meter) => ({ meter, delta: side.delta[meter.key] }))
+            .filter((d) => typeof d.delta === "number" && d.delta !== 0);
+          return (
+            <div key={side.teamId} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[12px]">
+              <span className="font-medium" style={{ color: colorOf(side.teamId) }}>
+                {nameOf(side.teamId)}
+              </span>
+              <span className="rounded border border-line px-1.5 py-[1px] text-[10px] text-fg">
+                {side.move ?? `弃权记${settlement.forfeit}`}
+              </span>
+              <span className="text-fg-faint">→</span>
+              {deltas.length === 0 ? (
+                <span className="mono text-[11px] text-fg-faint">无变化</span>
+              ) : (
+                deltas.map(({ meter, delta }) => (
+                  <span
+                    key={meter.key}
+                    className="mono text-[11px] tabular-nums"
+                    style={{ color: (delta as number) < 0 ? "var(--blood)" : "var(--jade)" }}
+                  >
+                    {meter.label}
+                    {(delta as number) > 0 ? "+" : ""}
+                    {fmtMeter(delta as number)}
+                  </span>
+                ))
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {readout.length > 0 && (
+        <div className="mono mt-1 border-t border-line/50 pt-1 text-[10px] text-fg-faint">
+          结算后：
+          {readout.map((row) => `${row.meter.label} ${row.parts.join(" / ")}`).join(" · ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtMeter(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+export const RoundCard = memo(function RoundCard({
   record,
-  teams,
+  teamIndex,
   slots,
   dimensions,
   board,
   prevScores,
+  repaired,
 }: {
   record: RoundView;
-  teams: TeamView[];
+  /** id → name/colour only. A stable table, so a live delta elsewhere cannot repaint history. */
+  teamIndex: TeamIndex;
   slots: SlotDef[];
   dimensions: Array<{ key: string; label: string }>;
   board?: BoardSpec | null;
   /** Previous round's score lines, used only for the per-meter delta. */
   prevScores?: Array<{ teamId: string; state?: Record<string, number> }> | null;
+  /** This round's numbers came from a ledger repair, so the judge's prose predates it. */
+  repaired?: boolean;
 }) {
-  const teamOf = (teamId: string) => teams.find((t) => t.id === teamId);
-  const nameOf = (teamId: string) => teamOf(teamId)?.name ?? "某方";
-  const colorOf = (teamId: string) => teamOf(teamId)?.color ?? "var(--fg-dim)";
+  const nameOf = (teamId: string) => teamIndex[teamId]?.name ?? "某方";
+  const colorOf = (teamId: string) => teamIndex[teamId]?.color ?? "var(--fg-dim)";
   const suddenWinner = record.verdict?.suddenWinnerTeamId
-    ? teamOf(record.verdict.suddenWinnerTeamId)
+    ? teamIndex[record.verdict.suddenWinnerTeamId]
     : undefined;
+  const blindMap = record.verdict?.blindMap;
+  // The ledger carries the delta, so a reading's "before" is exact even after a repair.
+  const prevOf = (line: { teamId: string; state?: Record<string, number> }) => {
+    const side = record.settlement?.sides.find((s) => s.teamId === line.teamId);
+    if (side && line.state) {
+      const before: Record<string, number> = {};
+      for (const [key, value] of Object.entries(line.state)) {
+        before[key] = Number((value - (side.delta[key] ?? 0)).toFixed(2));
+      }
+      return before;
+    }
+    return prevScores?.find((p) => p.teamId === line.teamId)?.state;
+  };
 
   return (
     <article className="panel px-4 py-3.5">
       <div className="mb-2.5 flex flex-wrap items-center gap-2">
         <span className="mono text-[11px] text-fg-faint">R{String(record.round).padStart(2, "0")}</span>
         {record.sudden && <span className="rounded border border-amber/40 px-1.5 text-[10px] text-amber">加时</span>}
+        {repaired && (
+          <span className="rounded border border-amber/40 bg-amber/10 px-1.5 text-[10px] text-amber" title="数字由账本重算，裁判原判词写在修正之前">
+            账本已修正
+          </span>
+        )}
         {suddenWinner && (
           <span
             className="rounded border px-1.5 text-[10px]"
@@ -268,9 +427,20 @@ export function RoundCard({
         )}
       </div>
 
-      {record.verdict?.publicSummary && (
-        <p className="mb-2.5 text-[13px] leading-relaxed text-fg/90">「{record.verdict.publicSummary}」</p>
-      )}
+      {record.settlement ? (
+        <>
+          <DuelRows board={board} settlement={record.settlement} nameOf={nameOf} colorOf={colorOf} />
+          {record.verdict?.verdict && (
+            <p className="mb-2.5 text-[12px] leading-relaxed text-fg-dim">
+              {repaired ? "原判词：" : ""}「{translateLetters(record.verdict.verdict, blindMap, nameOf)}」
+            </p>
+          )}
+        </>
+      ) : record.verdict?.publicSummary ? (
+        <p className="mb-2.5 text-[13px] leading-relaxed text-fg/90">
+          「{translateLetters(record.verdict.publicSummary, blindMap, nameOf)}」
+        </p>
+      ) : null}
 
       <div className="space-y-2">
         {record.submissions.map((s) => (
@@ -336,29 +506,8 @@ export function RoundCard({
                   {line.notes}
                 </span>
               </div>
-              <StateChips
-                board={board}
-                state={line.state}
-                prevState={prevScores?.find((p) => p.teamId === line.teamId)?.state}
-              />
-              {dimensions.length > 0 && (
-                <div className="mt-1 flex flex-wrap gap-1">
-                  {dimensions.map((d) => {
-                    const value = line.dimensions?.[d.key];
-                    return (
-                      <span
-                        key={d.key}
-                        className="rounded border border-line px-1.5 py-[1px] text-[10px] text-fg-faint"
-                      >
-                        {d.label}{" "}
-                        <span className="mono tabular-nums text-fg-dim">
-                          {Number.isFinite(value) ? value.toFixed(1) : "—"}
-                        </span>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
+              <ReadingChips board={board} state={line.state} prevState={prevOf(line)} />
+              <ScoreChips dimensions={dimensions} values={line.dimensions} weighted={line.weighted} />
             </div>
           ))}
         </div>
@@ -380,18 +529,23 @@ export function RoundCard({
       )}
     </article>
   );
-}
+});
 
 export function DmPanel({
   matchId,
   teams,
   paused,
   disabled,
+  resumable,
+  onRecover,
 }: {
   matchId: string;
   teams: TeamView[];
   paused: boolean;
   disabled: boolean;
+  /** The runtime is gone but a checkpoint exists: offer the rewind. */
+  resumable?: boolean;
+  onRecover?: () => void;
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -429,6 +583,16 @@ export function DmPanel({
       >
         {paused ? "继续对局" : "暂停对局"}
       </button>
+
+      {resumable && (
+        <button
+          disabled={busy}
+          onClick={() => onRecover?.()}
+          className="rounded-md border border-jade/40 bg-jade/10 px-3 py-2 text-[12px] text-jade transition hover:bg-jade/15 disabled:opacity-40"
+        >
+          从断点继续
+        </button>
+      )}
 
       <div className="space-y-2">
         <textarea

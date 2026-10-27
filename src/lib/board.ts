@@ -3,8 +3,11 @@
  *
  * The rules decide what a number means; this module only coerces it into the
  * declared range and folds per-round readings into one snapshot for the UI.
+ * A round that the engine settled (`board.settle`) is authoritative: the judge's
+ * own numbers are only a fallback for boards that predate the ledger.
  */
 
+import { foldBoardValues, type BoardRoundLike } from "@/engine/ledger";
 import type { BoardSpec } from "@/engine/types";
 
 export interface BoardIssue {
@@ -63,10 +66,7 @@ export function parseMarks(
   return { marks, issues };
 }
 
-export interface BoardRoundInput {
-  round: number;
-  verdict: { scores?: Array<{ teamId: string; state?: Record<string, number> | null }> } | null;
-}
+export type BoardRoundInput = BoardRoundLike;
 
 export interface BoardSnapshot {
   /** teamId → meter key → value. Starts from each meter's `init`. */
@@ -82,32 +82,63 @@ export function foldBoard(
   teamIds: string[],
   rounds: BoardRoundInput[],
 ): BoardSnapshot {
-  const values: Record<string, Record<string, number>> = {};
-  if (!board) return { values, round: 0, stale: false };
+  if (!board) return { values: {}, round: 0, stale: false };
 
-  for (const teamId of teamIds) {
-    values[teamId] = Object.fromEntries(board.meters.map((m) => [m.key, m.init]));
-  }
-
+  const values = foldBoardValues(board, teamIds, rounds);
   let lastRound = 0;
   for (const entry of rounds) {
-    if (!entry.verdict?.scores) continue;
-    let touched = false;
-    for (const line of entry.verdict.scores) {
-      const target = values[line.teamId];
-      if (!target || !line.state) continue;
-      for (const meter of board.meters) {
-        const value = line.state[meter.key];
-        if (typeof value !== "number" || !Number.isFinite(value)) continue;
-        target[meter.key] = value;
-        touched = true;
-      }
-    }
-    if (touched) lastRound = entry.round;
+    if (roundValues(board, teamIds, entry)) lastRound = entry.round;
   }
 
   const latestRound = rounds.length ? rounds[rounds.length - 1].round : 0;
   return { values, round: lastRound, stale: latestRound > 0 && lastRound < latestRound };
+}
+
+function roundValues(
+  board: BoardSpec,
+  teamIds: string[],
+  entry: BoardRoundInput,
+): Record<string, Record<string, number>> | null {
+  const out: Record<string, Record<string, number>> = {};
+  const sides = entry.settlement?.sides;
+  if (sides?.length) {
+    for (const side of sides) {
+      if (!teamIds.includes(side.teamId)) continue;
+      out[side.teamId] = { ...side.state };
+    }
+    return Object.keys(out).length ? out : null;
+  }
+  for (const line of entry.verdict?.scores ?? []) {
+    if (!line.state || !teamIds.includes(line.teamId)) continue;
+    out[line.teamId] = { ...line.state };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+export interface BoardSeriesPoint {
+  round: number;
+  /** Only the meters this round actually reported, per team. */
+  values: Record<string, Record<string, number>>;
+}
+
+/**
+ * Per-round readings for the trend line. Missing readings stay missing (a gap in
+ * the line), because interpolating over them is how a broken board looks healthy.
+ */
+export function boardSeries(
+  board: BoardSpec | undefined,
+  teamIds: string[],
+  rounds: BoardRoundInput[],
+): { points: BoardSeriesPoint[]; missing: number[] } {
+  if (!board) return { points: [], missing: [] };
+  const points: BoardSeriesPoint[] = [];
+  const missing: number[] = [];
+  for (const entry of rounds) {
+    const values = roundValues(board, teamIds, entry);
+    if (values) points.push({ round: entry.round, values });
+    else missing.push(entry.round);
+  }
+  return { points, missing };
 }
 
 /** Per-team, per-meter change between two snapshots (for the round cards). */

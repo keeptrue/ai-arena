@@ -7,15 +7,43 @@ import { anthropicThinkingPlan } from "./reasoning";
 interface AnthropicEvent {
   type: string;
   delta?: { type?: string; text?: string; thinking?: string; partial_json?: string };
-  message?: { usage?: { input_tokens?: number; output_tokens?: number } };
+  message?: { usage?: AnthropicUsage };
   usage?: { input_tokens?: number; output_tokens?: number };
   error?: { message?: string };
 }
+
+/**
+ * Anthropic reports the cached slice **outside** `input_tokens`, unlike every other
+ * vendor. The adapter folds all three back together so `promptTokens` keeps meaning
+ * "total input the model read" everywhere downstream.
+ */
+interface AnthropicUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+/** Below this the API cannot cache at all (1024 tokens on Sonnet-class models). */
+const CACHE_MIN_PREFIX_CHARS = 2_800;
 
 /** `max_tokens` is mandatory on the Messages API; this is what "no cap" sends. */
 export const ANTHROPIC_UNLIMITED_MAX_OUTPUT = 64_000;
 /** Older Claude models cap output at 8k; fall back here when the big number is rejected. */
 export const ANTHROPIC_FALLBACK_MAX_OUTPUT = 8_192;
+
+/** Chars from the start of the turn list to the deepest marked breakpoint, or null. */
+function stablePrefixChars(req: CallRequest): number | null {
+  let chars = 0;
+  let cut: number | null = null;
+  for (const message of req.messages) {
+    chars += message.content.length;
+    if (typeof message.cacheAt === "number" && message.cacheAt > 0) {
+      cut = chars - message.content.length + Math.min(message.cacheAt, message.content.length);
+    }
+  }
+  return cut;
+}
 
 export const anthropic: ProviderAdapter = {
   kind: "anthropic",
@@ -28,6 +56,35 @@ export const anthropic: ProviderAdapter = {
       typeof req.maxTokens === "number" && req.maxTokens > 0 ? req.maxTokens : null;
     const unlimited = explicit === null;
 
+    // Where the stable prefix ends. `null` = the caller marked nothing, so this
+    // request has no reusable head and we send plain strings.
+    const cacheCut = stablePrefixChars(req);
+    const cacheMode = req.model.providerCacheMode ?? "explicit";
+    const useCache =
+      cacheMode !== "none" && cacheCut !== null && req.system.length + cacheCut >= CACHE_MIN_PREFIX_CHARS;
+
+    const systemWire = () =>
+      useCache
+        ? [{ type: "text", text: req.system, cache_control: { type: "ephemeral" } }]
+        : req.system;
+
+    const messagesWire = () =>
+      req.messages.map((m) => {
+        const cut = m.cacheAt;
+        // Anthropic concatenates adjacent text blocks, so splitting is invisible to
+        // the model — it only tells the cache where the reusable prefix stops.
+        if (!useCache || typeof cut !== "number" || cut <= 0 || cut >= m.content.length) {
+          return { role: m.role, content: m.content };
+        }
+        return {
+          role: m.role,
+          content: [
+            { type: "text", text: m.content.slice(0, cut), cache_control: { type: "ephemeral" } },
+            { type: "text", text: m.content.slice(cut) },
+          ],
+        };
+      });
+
     const buildBody = (maxTokens: number) => {
       // Anthropic rejects budget_tokens >= max_tokens, so the plan degrades to null
       // whenever the configured strength cannot fit inside the output window.
@@ -35,8 +92,8 @@ export const anthropic: ProviderAdapter = {
       const body: Record<string, unknown> = {
         model: req.model.modelId,
         max_tokens: maxTokens,
-        system: req.system,
-        messages: req.messages,
+        system: systemWire(),
+        messages: messagesWire(),
         stream: true,
       };
       if (plan) {
@@ -75,10 +132,14 @@ export const anthropic: ProviderAdapter = {
     let thinking = "";
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedPromptTokens = 0;
+    let cacheWriteTokens = 0;
     let streamError: string | null = null;
 
     await readSse(res.body, (data) => {
       if (data === "[DONE]") return;
+      // `ping` and `message_delta` carry no content but do prove the stream lives.
+      req.onBeat?.();
       let ev: AnthropicEvent;
       try {
         ev = JSON.parse(data) as AnthropicEvent;
@@ -90,7 +151,12 @@ export const anthropic: ProviderAdapter = {
         return;
       }
       if (ev.type === "message_start" && ev.message?.usage) {
-        promptTokens = ev.message.usage.input_tokens ?? 0;
+        const usage = ev.message.usage;
+        cachedPromptTokens = usage.cache_read_input_tokens ?? 0;
+        cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
+        // Cached and cache-writing tokens sit outside `input_tokens`; add them back
+        // so `promptTokens` stays "everything the model read".
+        promptTokens = (usage.input_tokens ?? 0) + cachedPromptTokens + cacheWriteTokens;
       }
       if (ev.type === "content_block_delta" && ev.delta) {
         if (ev.delta.type === "thinking_delta" && ev.delta.thinking) {
@@ -104,13 +170,13 @@ export const anthropic: ProviderAdapter = {
       if (ev.type === "message_delta" && ev.usage) {
         completionTokens = ev.usage.output_tokens ?? completionTokens;
       }
-    });
+    }, req.onBeat);
 
     if (streamError) throw new Error(`${req.model.providerName}: ${streamError}`);
     return {
       text,
       thinking,
-      usage: { promptTokens, completionTokens },
+      usage: { promptTokens, completionTokens, cachedPromptTokens, cacheWriteTokens },
       latencyMs: Date.now() - started,
     };
   },

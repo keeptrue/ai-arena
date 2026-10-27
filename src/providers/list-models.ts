@@ -22,6 +22,12 @@ export async function listRemoteModels(input: {
       { id: "rehearsal-b", display: "演练体 B" },
       { id: "rehearsal-c", display: "演练体 C" },
       { id: "rehearsal-d", display: "演练体 D" },
+      { id: "rehearsal-e", display: "演练体 E" },
+      { id: "rehearsal-f", display: "演练体 F" },
+      { id: "rehearsal-g", display: "演练体 G" },
+      { id: "rehearsal-h", display: "演练体 H" },
+      { id: "rehearsal-i", display: "演练体 I" },
+      { id: "rehearsal-j", display: "演练体 J" },
     ];
   }
 

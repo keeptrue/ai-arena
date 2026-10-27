@@ -10,7 +10,12 @@ interface GeminiPart {
 }
 interface GeminiChunk {
   candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
-  usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    /** Implicit-cache hit: part of `promptTokenCount`, billed at the cached rate. */
+    cachedContentTokenCount?: number;
+  };
   error?: { message?: string };
 }
 
@@ -53,10 +58,13 @@ export const gemini: ProviderAdapter = {
     let thinking = "";
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedPromptTokens = 0;
     let streamError: string | null = null;
 
     await readSse(res.body, (data) => {
       if (data === "[DONE]") return;
+      // Usage-only and empty-candidate frames still mean the stream is alive.
+      req.onBeat?.();
       let chunk: GeminiChunk;
       try {
         chunk = JSON.parse(data) as GeminiChunk;
@@ -81,14 +89,15 @@ export const gemini: ProviderAdapter = {
       if (chunk.usageMetadata) {
         promptTokens = chunk.usageMetadata.promptTokenCount ?? promptTokens;
         completionTokens = chunk.usageMetadata.candidatesTokenCount ?? completionTokens;
+        cachedPromptTokens = chunk.usageMetadata.cachedContentTokenCount ?? cachedPromptTokens;
       }
-    });
+    }, req.onBeat);
 
     if (streamError) throw new Error(`${req.model.providerName}: ${streamError}`);
     return {
       text,
       thinking,
-      usage: { promptTokens, completionTokens },
+      usage: { promptTokens, completionTokens, cachedPromptTokens },
       latencyMs: Date.now() - started,
     };
   },

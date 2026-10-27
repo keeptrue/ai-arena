@@ -38,6 +38,7 @@ export function RulesetEditor({ initial }: { initial: RulesetItem[] }) {
     initial[0]?.blueprint ? JSON.stringify(initial[0].blueprint, null, 2) : "",
   );
   const [busy, setBusy] = useState<"compile" | "save" | null>(null);
+  const isWerewolf = blueprint?.mode === "werewolf";
   const [message, setMessage] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
 
   function select(item: RulesetItem) {
@@ -148,7 +149,8 @@ export function RulesetEditor({ initial }: { initial: RulesetItem[] }) {
           <span className="label">规则正文（自然语言）</span>
           <button
             onClick={compile}
-            disabled={busy !== null || sourceMd.trim().length < 20}
+            disabled={busy !== null || sourceMd.trim().length < 20 || isWerewolf}
+            title={isWerewolf ? "九人局是结构化对局类型，不走自然语言评分编译器" : ""}
             className="rounded-md border border-jade/40 bg-jade/10 px-3 py-1.5 text-[12px] text-jade transition hover:bg-jade/15 disabled:opacity-40"
           >
             {busy === "compile" ? "编译中…" : "编译成蓝图"}
@@ -178,26 +180,45 @@ export function RulesetEditor({ initial }: { initial: RulesetItem[] }) {
           <div className="panel space-y-2 p-3 text-[12px]">
             <div className="flex items-baseline justify-between">
               <span className="text-[14px] font-medium">{blueprint.name}</span>
-              <span className="mono text-[10px] text-fg-faint">{blueprint.rounds} 轮</span>
+              <span className="mono text-[10px] text-fg-faint">
+                {isWerewolf ? `${blueprint.seats} 席` : `${blueprint.rounds} 轮`}
+              </span>
             </div>
             <p className="text-fg-dim">{blueprint.tagline}</p>
-            <div className="flex flex-wrap gap-1">
-              {(blueprint.submission?.slots ?? []).map((s: any) => (
-                <span key={s.key} className="rounded border border-line px-1.5 py-0.5 text-[10px] text-fg-faint">
-                  {s.label} · {s.type}
-                  {s.reveal === "secret" ? " 🔒" : ""}
-                </span>
-              ))}
-            </div>
-            <div className="space-y-0.5">
-              {(blueprint.rubric?.dimensions ?? []).map((d: any) => (
-                <div key={d.key} className="flex items-baseline gap-2 text-[11px]">
-                  <span className="w-16 shrink-0 text-fg-dim">{d.label}</span>
-                  <span className="mono text-fg-faint">{Math.round(d.weight * 100)}%</span>
-                  <span className="truncate text-fg-faint">{d.hint}</span>
+            {isWerewolf ? (
+              <>
+                <div className="flex flex-wrap gap-1">
+                  {(blueprint.roles ?? []).map((r: any) => (
+                    <span key={r.id} className="rounded border border-line px-1.5 py-0.5 text-[10px] text-fg-faint">
+                      {r.label} ×{r.count}
+                    </span>
+                  ))}
                 </div>
-              ))}
-            </div>
+                <p className="text-[11px] text-fg-faint">
+                  屠边胜负 · 无警长 · 首夜可自救 · 平票 PK · 最多 {blueprint.rules?.maxDays ?? 8} 天
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-1">
+                  {(blueprint.submission?.slots ?? []).map((s: any) => (
+                    <span key={s.key} className="rounded border border-line px-1.5 py-0.5 text-[10px] text-fg-faint">
+                      {s.label} · {s.type}
+                      {s.reveal === "secret" ? " 🔒" : ""}
+                    </span>
+                  ))}
+                </div>
+                <div className="space-y-0.5">
+                  {(blueprint.rubric?.dimensions ?? []).map((d: any) => (
+                    <div key={d.key} className="flex items-baseline gap-2 text-[11px]">
+                      <span className="w-16 shrink-0 text-fg-dim">{d.label}</span>
+                      <span className="mono text-fg-faint">{Math.round(d.weight * 100)}%</span>
+                      <span className="truncate text-fg-faint">{d.hint}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         )}
 

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { PROMPT_SLOTS } from "../src/engine/prompt-templates";
-import { splitThinking, THINKING_LIMIT } from "../src/lib/thinking";
+import {
+  LIVE_TAIL_CHARS,
+  splitBlocks,
+  splitThinking,
+  tailWindowStart,
+  THINKING_LIMIT,
+} from "../src/lib/thinking";
 
 describe("splitThinking", () => {
   test("keeps short notes whole", () => {
@@ -55,5 +61,41 @@ describe("audience thinking prompt", () => {
     expect(body).toContain("为什么这么选");
     expect(body).toContain("对手与裁判都看不到");
     expect(body).not.toContain("200 字");
+  });
+});
+
+describe("live tail window", () => {
+  test("short streams are shown whole", () => {
+    const chunks = ["我要", "说两句"];
+    expect(tailWindowStart(chunks, 500)).toBe(0);
+  });
+
+  test("long streams keep only the tail, and the boundary chunk stays", () => {
+    const chunks = Array.from({ length: 100 }, () => "字".repeat(60)); // 6 000 chars
+    const start = tailWindowStart(chunks, 1_000);
+    expect(start).toBeGreaterThan(0);
+    const shown = chunks.slice(start).join("");
+    expect(shown.length).toBeGreaterThan(1_000 - 60);
+    expect(shown.length).toBeLessThanOrEqual(1_000);
+  });
+
+  test("an oversized single chunk is never truncated", () => {
+    const chunks = ["前文", "字".repeat(LIVE_TAIL_CHARS * 2)];
+    const start = tailWindowStart(chunks, 100);
+    expect(chunks.slice(start).join("")).toBe(chunks[1]);
+  });
+
+  test("a degenerate limit renders nothing to trim", () => {
+    expect(tailWindowStart(["a", "b"], 0)).toBe(2);
+  });
+});
+
+describe("splitBlocks", () => {
+  test("keeps line structure so pre-wrap spacing survives", () => {
+    expect(splitBlocks("一\n\n二")).toEqual(["一", "", "二"]);
+  });
+
+  test("empty text yields no blocks", () => {
+    expect(splitBlocks("")).toEqual([]);
   });
 });

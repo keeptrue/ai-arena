@@ -5,6 +5,12 @@ import { ProviderError } from "./types";
 export async function readSse(
   body: ReadableStream<Uint8Array> | null,
   onEvent: (data: string, event: string | null) => void,
+  /**
+   * Liveness tap: fires for every chunk of bytes, including `:` keep-alive
+   * comments and frames that turn out to carry no content. A gateway that pings
+   * while a model thinks must look alive, not silent.
+   */
+  onBeat?: () => void,
 ): Promise<void> {
   if (!body) return;
   const reader = body.getReader();
@@ -28,6 +34,7 @@ export async function readSse(
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (value && value.byteLength > 0) onBeat?.();
     buffer += decoder.decode(value, { stream: true });
 
     let nl: number;

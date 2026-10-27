@@ -16,7 +16,7 @@ import type { Blueprint, ModelSnapshot } from "@/engine/types";
 export interface CompileResult {
   blueprint: Blueprint;
   compiler: string;
-  usage: { promptTokens: number; completionTokens: number };
+  usage: { promptTokens: number; completionTokens: number; cachedPromptTokens?: number };
   warnings: string[];
 }
 
@@ -97,6 +97,7 @@ export async function compileRuleset(input: {
       usage: {
         promptTokens: first.usage.promptTokens + repaired.usage.promptTokens,
         completionTokens: first.usage.completionTokens + repaired.usage.completionTokens,
+        cachedPromptTokens: (first.usage.cachedPromptTokens ?? 0) + (repaired.usage.cachedPromptTokens ?? 0),
       },
       warnings,
     };

@@ -4,13 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev -p 3000",
-    "build": "next build",
-    "start": "next start -p 3000",
+    "dev": "bun run export:build && next dev -p 3099",
+    "build": "bun run export:build && next build",
+    "start": "bun run export:build && next start -p 3099",
+    "export:build": "bun run scripts/build-export-assets.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "db:migrate": "bun run scripts/migrate.ts",
-    "db:seed": "bun run scripts/seed.ts"
+    "db:seed": "bun run scripts/seed.ts",
+    "db:rulesets": "bun run scripts/refresh-rulesets.ts",
+    "db:repair": "bun run scripts/repair-board.ts"
   },
   "dependencies": {
     "next": "^16.4.2",

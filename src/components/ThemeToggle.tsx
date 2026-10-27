@@ -20,14 +20,22 @@ export function ThemeToggle() {
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
-    const stored = (localStorage.getItem(KEY) as Mode | null) ?? "auto";
-    setMode(stored);
+    try {
+      const stored = (localStorage.getItem(KEY) as Mode | null) ?? "auto";
+      setMode(stored);
+    } catch {
+      /* file:// and private mode can refuse storage; keep the default */
+    }
     setMounted(true);
   }, []);
 
   useEffect(() => {
     if (!mounted) return;
-    localStorage.setItem(KEY, mode);
+    try {
+      localStorage.setItem(KEY, mode);
+    } catch {
+      /* the toggle still works in memory */
+    }
     applyTheme(mode);
 
     if (mode !== "auto") return;

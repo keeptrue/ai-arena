@@ -1,7 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { splitThinking, THINKING_LIMIT } from "@/lib/thinking";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  LIVE_TAIL_CHARS,
+  splitBlocks,
+  splitThinking,
+  tailWindowStart,
+  THINKING_LIMIT,
+} from "@/lib/thinking";
 import type { MemberView, SlotDef } from "./arena-parts";
 
 /** Chinese labels for the reasoning ladder advertised by models.dev. */
@@ -44,6 +50,8 @@ export function ModelMetaLine({ member }: { member: MemberView }) {
     member.modelId,
     member.kind,
     member.temperature != null ? `temp ${member.temperature}` : null,
+    // Only when this model carries its own ceiling; the global default stays quiet.
+    member.callTimeoutMs ? `时限 ${Math.round(member.callTimeoutMs / 60_000)}m` : null,
   ].filter((b): b is string => Boolean(b));
   const right = [
     member.usage
@@ -226,8 +234,16 @@ export function ThinkingBody({
   useEffect(() => {
     if (!autoScroll) return;
     const el = ref.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    // Follow the tail only while the reader is already at the bottom: hijacking the
+    // scroll position mid-read is worse than a stale viewport.
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom || el.scrollTop === 0) el.scrollTop = el.scrollHeight;
   }, [text, autoScroll]);
+
+  // Expanded prose is split into blocks so the browser can skip layout for the parts
+  // that are scrolled out of view. Without it, every delta re-lays out the whole text.
+  const blocks = useMemo(() => (expanded ? splitBlocks(text) : null), [expanded, text]);
 
   if (!text) return <p className="text-[12px] leading-[1.8] text-fg-faint">{placeholder}</p>;
 
@@ -240,7 +256,13 @@ export function ThinkingBody({
           expanded ? "max-h-[420px] overflow-y-auto" : ""
         }`}
       >
-        {expanded ? text : head}
+        {expanded && blocks
+          ? blocks.map((block, i) => (
+              <p key={i} style={{ contentVisibility: "auto", containIntrinsicSize: "auto 2.4rem" }}>
+                {block}
+              </p>
+            ))
+          : head}
         {over && !expanded && <span className="text-fg-faint">…</span>}
         {!done && (
           <span className="ml-0.5 inline-block w-[5px] animate-pulse bg-fg-dim/60">&nbsp;</span>
@@ -260,15 +282,28 @@ export function ThinkingBody({
   );
 }
 
-export function ThinkingCount({ member }: { member: MemberView }) {
-  const chars = member.thinking.join("").length;
+export function ThinkingCount({
+  chars,
+  status,
+  done,
+  live = true,
+}: {
+  /** Precomputed length: joining the chunk list on every render was pure waste. */
+  chars: number;
+  status: MemberView["status"];
+  done: boolean;
+  /** False once the runtime is gone: "推演中" would be a lie. */
+  live?: boolean;
+}) {
   const over = chars > THINKING_LIMIT;
   const state =
-    member.status === "thinking"
-      ? "推演中"
-      : member.status === "forfeit"
+    status === "thinking"
+      ? live
+        ? "推演中"
+        : "已中断"
+      : status === "forfeit"
         ? "中断"
-        : member.thinkingDone
+        : done
           ? "已定稿"
           : "待命";
   return (
@@ -276,5 +311,45 @@ export function ThinkingCount({ member }: { member: MemberView }) {
       {chars > 0 ? `${chars.toLocaleString("en-US")} 字${over ? " · 超 500" : ""} · ` : ""}
       {state}
     </span>
+  );
+}
+
+/* ── live stream: bounded tail, append-only ────────────────────────── */
+
+/**
+ * The judge's reasoning is the one surface that shows a whole stream live. Rendering
+ * it as one growing paragraph meant every event rebuilt a 30 000-character text node;
+ * here only the trailing window is in the DOM, and chunks are keyed so React inserts
+ * the new node instead of replacing the block.
+ */
+export function LiveStream({ chunks, label }: { chunks: string[]; label: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const start = useMemo(() => tailWindowStart(chunks, LIVE_TAIL_CHARS), [chunks]);
+  const shown = chunks.slice(start);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (nearBottom || el.scrollTop === 0) el.scrollTop = el.scrollHeight;
+  }, [chunks.length]);
+
+  return (
+    <div>
+      <div className="label mb-1.5">{label}</div>
+      <div
+        ref={ref}
+        className="mono max-h-[360px] overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-fg-dim/80"
+      >
+        {start > 0 && (
+          <p className="mb-1 text-fg-faint">
+            ↑ 只显示最近约 {LIVE_TAIL_CHARS.toLocaleString("en-US")} 字 · 完整文本在本轮裁决后可展开
+          </p>
+        )}
+        {shown.map((chunk, i) => (
+          <span key={start + i}>{chunk}</span>
+        ))}
+      </div>
+    </div>
   );
 }

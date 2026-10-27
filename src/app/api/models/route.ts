@@ -1,6 +1,7 @@
 import { ensureSeedData, getModelRow, listModels, updateModel } from "@/db/repo";
+import { MAX_CALL_TIMEOUT_MS, MIN_CALL_TIMEOUT_MS } from "@/engine/runtime";
 import { normalizeEffort, reconcileEffort, suggestedEffort } from "@/engine/reasoning";
-import type { ModelCard, ReasoningEffort } from "@/engine/types";
+import type { ModelCard, ProviderCacheMode, ReasoningEffort } from "@/engine/types";
 import { fetchModelCard } from "@/providers/models-dev";
 
 export const runtime = "nodejs";
@@ -20,6 +21,10 @@ interface PatchBody {
   reasoningEffort?: ReasoningEffort | "" | null;
   /** Explicit thinking budget in tokens; null clears it. */
   thinkingBudget?: number | null;
+  /** Per-model call ceiling in ms; null clears it back to the global default. */
+  callTimeoutMs?: number | null;
+  /** auto / explicit / none; null clears it back to "infer from the provider kind". */
+  providerCacheMode?: ProviderCacheMode | "" | null;
   /** Pull the model card from models.dev and align reasoning support with it. */
   calibrate?: boolean;
   inContenderPool?: boolean;
@@ -57,6 +62,19 @@ export async function PATCH(req: Request) {
     }
   }
 
+  if (body.providerCacheMode !== undefined) {
+    if (body.providerCacheMode === null || body.providerCacheMode === "") {
+      patch.providerCacheMode = null;
+    } else if (body.providerCacheMode === "auto" || body.providerCacheMode === "explicit" || body.providerCacheMode === "none") {
+      patch.providerCacheMode = body.providerCacheMode;
+    } else {
+      return Response.json(
+        { error: `缓存模式取值不认识：${String(body.providerCacheMode)}` },
+        { status: 400 },
+      );
+    }
+  }
+
   if (body.thinkingBudget !== undefined) {
     if (body.thinkingBudget === null) {
       patch.thinkingBudget = null;
@@ -66,6 +84,21 @@ export async function PATCH(req: Request) {
         return Response.json({ error: "思考预算必须是 0–200000 的整数" }, { status: 400 });
       }
       patch.thinkingBudget = budget > 0 ? budget : null;
+    }
+  }
+
+  if (body.callTimeoutMs !== undefined) {
+    if (body.callTimeoutMs === null) {
+      patch.callTimeoutMs = null;
+    } else {
+      const timeout = Math.floor(Number(body.callTimeoutMs));
+      if (!Number.isFinite(timeout) || timeout < MIN_CALL_TIMEOUT_MS || timeout > MAX_CALL_TIMEOUT_MS) {
+        return Response.json(
+          { error: "思考时限必须是 1–120 分钟（60000–7200000 毫秒）" },
+          { status: 400 },
+        );
+      }
+      patch.callTimeoutMs = timeout;
     }
   }
 

@@ -1,5 +1,6 @@
 import { ensureSeedData, listRulesets, upsertRuleset } from "@/db/repo";
-import { hashBlueprint, parseBlueprint } from "@/engine/blueprint";
+import { hashBlueprint } from "@/engine/blueprint";
+import { parseAnyBlueprint } from "@/engine/game";
 import { syncBuiltinRulesets } from "@/lib/rulesets";
 
 export const runtime = "nodejs";
@@ -23,7 +24,7 @@ export async function POST(req: Request) {
     return Response.json({ error: "slug 只能是小写字母/数字/连字符" }, { status: 400 });
   }
   try {
-    const blueprint = parseBlueprint(body.blueprint);
+    const blueprint = parseAnyBlueprint(body.blueprint);
     const id = upsertRuleset({
       slug: body.slug,
       name: body.name?.trim() || blueprint.name,

@@ -8,6 +8,7 @@
  */
 
 import { teamLetters } from "./blueprint";
+import { boardOrder, foldBoardValues, settleRound } from "./ledger";
 import type {
   ArenaEvent,
   Blueprint,
@@ -20,6 +21,7 @@ import type {
   ParticipantState,
   ReduceResult,
   RoundRecord,
+  Settlement,
   Submission,
   TeamState,
 } from "./types";
@@ -77,6 +79,28 @@ function resetStatuses(participants: ParticipantState[]): ParticipantState[] {
   return participants.map((p) => ({ ...p, status: "idle" as const }));
 }
 
+/**
+ * Settle the declared ledger before the judge is called. Pure and deterministic:
+ * the numbers the audience sees must not depend on how well a model can add.
+ */
+export function computeSettlement(state: MatchState): Settlement | null {
+  const board = state.blueprint.board;
+  if (!board?.settle || state.suddenDeath) return null;
+  const teamIds = boardOrder(state.teams);
+  const moves = state.participants.map((p) => {
+    const sub = state.pending[p.id];
+    const value = sub && sub.status === "ready" ? sub.content[board.settle!.by] : undefined;
+    return { teamId: p.teamId, value: value === undefined || value === null ? null : String(value) };
+  });
+  return settleRound({
+    board,
+    teams: state.teams,
+    moves,
+    prior: foldBoardValues(board, teamIds, state.history),
+    round: state.round,
+  });
+}
+
 /* ── construction ──────────────────────────────────────────────────── */
 
 export function createMatchState(input: {
@@ -123,9 +147,44 @@ export function reduce(state: MatchState, action: MatchAction): ReduceResult {
       return onVerdict(state, action.verdict);
     case "dm":
       return onDm(state, action.intervention);
+    case "recall":
+      return recallSubmission(state, action.participantId);
     case "abort":
       return finish({ ...state }, [], null, `aborted:${action.reason}`, Date.now());
   }
+}
+
+/**
+ * Pick a match back up after the process died: ask again for exactly what the
+ * round is still missing, and call the judge only when the round is actually in.
+ *
+ * Submissions already in `state.pending` are never re-requested, and `onSubmit`
+ * ignores duplicates anyway, so a recovery can never make a seat act twice.
+ */
+export function recoverRound(state: MatchState): ReduceResult {
+  if (state.phase === "idle" || state.phase === "done") return { state, effects: [] };
+
+  const settlement = computeSettlement(state);
+  if (state.phase === "judging") {
+    return {
+      state,
+      effects: [
+        { kind: "call_judge", round: state.round, sudden: state.suddenDeath, settlement },
+      ],
+    };
+  }
+
+  const owed = state.participants
+    .filter((p) => !state.pending[p.id] && p.status !== "forfeit")
+    .map((p) => p.id);
+  if (owed.length > 0) return { state, effects: [{ kind: "call_participants", ids: owed }] };
+
+  // Everyone is in but the phase never moved on: the last submit died before the
+  // judge was called. Asking the judge now is the same step, not a second one.
+  return {
+    state,
+    effects: [{ kind: "call_judge", round: state.round, sudden: state.suddenDeath, settlement }],
+  };
 }
 
 function onStart(state: MatchState, at: number): ReduceResult {
@@ -208,6 +267,9 @@ function onSubmit(state: MatchState, submission: Submission): ReduceResult {
       calls: state.budget.calls + 1,
       tokens:
         state.budget.tokens + submission.usage.promptTokens + submission.usage.completionTokens,
+      // A subset of `tokens`, not an addition to it: the same input, seen twice.
+      cachedTokens: (state.budget.cachedTokens ?? 0) + (submission.usage.cachedPromptTokens ?? 0),
+      cacheWriteTokens: (state.budget.cacheWriteTokens ?? 0) + (submission.usage.cacheWriteTokens ?? 0),
     },
   };
 
@@ -280,7 +342,12 @@ function onSubmit(state: MatchState, submission: Submission): ReduceResult {
       payload: { round: next.round, ready, forfeits, total: next.participants.length },
     },
   });
-  effects.push({ kind: "call_judge", round: next.round, sudden: next.suddenDeath });
+  effects.push({
+    kind: "call_judge",
+    round: next.round,
+    sudden: next.suddenDeath,
+    settlement: computeSettlement(next),
+  });
   return { state: next, effects };
 }
 
@@ -295,6 +362,8 @@ function onVerdict(state: MatchState, verdict: JudgeVerdict): ReduceResult {
       ...state.budget,
       calls: state.budget.calls + 1,
       tokens: state.budget.tokens + verdict.usage.promptTokens + verdict.usage.completionTokens,
+      cachedTokens: (state.budget.cachedTokens ?? 0) + (verdict.usage.cachedPromptTokens ?? 0),
+      cacheWriteTokens: (state.budget.cacheWriteTokens ?? 0) + (verdict.usage.cacheWriteTokens ?? 0),
     },
   };
 
@@ -322,6 +391,7 @@ function onVerdict(state: MatchState, verdict: JudgeVerdict): ReduceResult {
     }),
     verdict,
     teamScores,
+    settlement: verdict.settlement ?? null,
   };
   next.history.push(record);
 
@@ -341,6 +411,7 @@ function onVerdict(state: MatchState, verdict: JudgeVerdict): ReduceResult {
           publicSummary: verdict.publicSummary,
           judge: verdict.judgeModel.display,
           suddenWinnerTeamId: verdict.suddenWinnerTeamId ?? null,
+          settlement: verdict.settlement ?? null,
         },
       },
     },
@@ -354,6 +425,7 @@ function onVerdict(state: MatchState, verdict: JudgeVerdict): ReduceResult {
           teamScores,
           totals: Object.fromEntries(next.teams.map((t) => [t.id, t.totalScore])),
           publicSummary: verdict.publicSummary,
+          settlement: record.settlement ?? null,
         },
       },
     },
@@ -450,6 +522,54 @@ function onDm(state: MatchState, intervention: Intervention): ReduceResult {
   }
 
   return { state: next, effects };
+}
+
+/**
+ * Re-open one participant's turn inside the current round.
+ *
+ * A cut window is indistinguishable from a dead model, and a false one must not
+ * cost the match: the seat goes back to "has not answered", the strike its team
+ * was charged is refunded, and the runtime calls it again. Legal only while the
+ * round is still being collected — once the judge holds the material, rewinding
+ * would be rewriting a verdict.
+ */
+export function recallSubmission(state: MatchState, participantId: string): ReduceResult {
+  if (state.phase !== "collecting" && state.phase !== "sudden") return { state, effects: [] };
+  const submission = state.pending[participantId];
+  if (!submission || submission.status !== "forfeit") return { state, effects: [] };
+  const participant = state.participants.find((p) => p.id === participantId);
+  if (!participant) return { state, effects: [] };
+
+  const pending = { ...state.pending };
+  delete pending[participantId];
+
+  const next: MatchState = {
+    ...state,
+    pending,
+    participants: state.participants.map((p) =>
+      p.id === participantId ? { ...p, status: "idle" } : p,
+    ),
+    teams: state.teams.map((t) =>
+      t.id === participant.teamId ? { ...t, forfeits: Math.max(0, t.forfeits - 1) } : t,
+    ),
+  };
+
+  return {
+    state: next,
+    effects: [
+      {
+        kind: "emit",
+        event: {
+          type: "seat.recalled",
+          seat: participant.seat,
+          teamId: participant.teamId,
+          ts: Date.now(),
+          payload: { round: next.round, participantId, reason: "manual" },
+        },
+      },
+      { kind: "call_participants", ids: [participantId] },
+    ],
+  };
 }
 
 function finish(

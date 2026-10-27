@@ -1,13 +1,15 @@
 /**
  * Incremental parser for the participant output protocol.
  *
- *   <<<THINK>>>
+ *   <<<THINK>>>            (optional live draft; werewolf only)
  *   free-form reasoning, streamed live to the audience only
  *   <<<SUBMIT>>>
- *   {"bid": 300, "statement": "..."}
+ *   {"note": "写给观众的旁白", "bid": 300, "statement": "..."}
  *
  * The thinking half is forwarded as it arrives; the submission half is buffered and
- * only handed over once complete. Every degradation path is explicit so the runtime
+ * only handed over once complete. A `note` field inside the payload is authoritative
+ * when the caller opts in (werewolf), so a model cannot satisfy the schema by
+ * skipping the free-form marker. Every degradation path is explicit so the runtime
  * can record an `anomaly` instead of silently swallowing a bad turn.
  */
 
@@ -92,6 +94,15 @@ export class SubmissionStreamParser {
   private thinkingText = "";
   private submitText = "";
   private rawText = "";
+  /** How much of the `note` field has already been streamed to the audience. */
+  private noteStreamed = 0;
+
+  /**
+   * `noteField` opts into the structured protocol: a `note` string inside the
+   * submit JSON is the audience note, even when the model skipped `<<<THINK>>>`.
+   * The rubric runtime leaves it off so a blueprint slot named `note` is untouched.
+   */
+  constructor(private readonly options: { noteField?: boolean } = {}) {}
 
   /** Feed a delta; returns the newly available thinking text ("" if none). */
   push(chunk: string): string {
@@ -148,6 +159,17 @@ export class SubmissionStreamParser {
 
       this.submitText += this.buf;
       this.buf = "";
+      // The structured protocol puts the audience note inside the payload, so a
+      // model that skips the THINK draft would otherwise stream nothing at all.
+      // Re-scanning the partial JSON is cheap (the payload is a few hundred
+      // chars) and only runs on the noteField opt-in.
+      if (this.options.noteField && !this.thinkingText.trim()) {
+        const note = scanNoteField(this.submitText);
+        if (note.length > this.noteStreamed) {
+          out += note.slice(this.noteStreamed);
+          this.noteStreamed = note.length;
+        }
+      }
       return out;
     }
   }
@@ -202,10 +224,21 @@ export class SubmissionStreamParser {
 
     const parsed = parseSubmitPayload(this.submitText);
 
-    // Some models nest their reasoning inside the payload instead of before it.
-    if (parsed.content && !this.thinkingText.trim()) {
+    // A structured `note` is authoritative when the caller opted in: it survives a
+    // model that skipped `<<<THINK>>>`, and it wins over a live draft.
+    const jsonNote =
+      this.options.noteField && parsed.content && typeof parsed.content.note === "string"
+        ? parsed.content.note.trim()
+        : "";
+    if (jsonNote) {
+      this.thinkingText = jsonNote;
+    } else if (parsed.content && !this.thinkingText.trim()) {
+      // Some models nest their reasoning inside the payload instead of before it.
       const inner = parsed.content.thinking ?? parsed.content.reasoning ?? parsed.content.thought;
       if (typeof inner === "string" && inner.trim()) this.thinkingText = inner.trim();
+    }
+    if (this.options.noteField && parsed.content && !this.thinkingText.trim()) {
+      anomalies.push("missing_note");
     }
 
     if (parsed.error) anomalies.push(parsed.error);
@@ -223,6 +256,52 @@ function salvageObject(text: string): string | null {
   const end = text.lastIndexOf("}");
   if (end <= start) return null;
   return text.slice(start, end + 1);
+}
+
+const NOTE_KEY = /"note"\s*:/;
+const JSON_ESCAPES: Record<string, string> = {
+  n: "\n",
+  t: "\t",
+  r: "\r",
+  b: "\b",
+  f: "\f",
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+};
+
+/**
+ * Pull the `note` string out of a submit payload that may still be arriving.
+ * Returns whatever has been decoded so far: an incomplete escape or a missing
+ * closing quote just stops the scan, and the next chunk resumes from there.
+ */
+function scanNoteField(text: string): string {
+  const key = NOTE_KEY.exec(text);
+  if (!key) return "";
+  const open = text.indexOf('"', key.index + key[0].length);
+  if (open < 0) return "";
+  let out = "";
+  for (let i = open + 1; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"') break;
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = text[i + 1];
+    if (next === undefined) break;
+    if (next === "u") {
+      const hex = text.slice(i + 2, i + 6);
+      if (hex.length < 4) break;
+      const code = Number.parseInt(hex, 16);
+      if (!Number.isNaN(code)) out += String.fromCharCode(code);
+      i += 5;
+      continue;
+    }
+    out += JSON_ESCAPES[next] ?? next;
+    i += 1;
+  }
+  return out;
 }
 
 function looksLikeJsonStart(buf: string): boolean {

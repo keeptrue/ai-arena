@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import { parseBlueprint } from "@/engine/blueprint";
+import { parseAnyBlueprint } from "@/engine/game";
 import { getRulesetBySlug, upsertRuleset } from "@/db/repo";
 
 export const RULESETS_DIR = path.join(process.cwd(), "rulesets");
@@ -23,7 +23,7 @@ export async function syncBuiltinRulesets(): Promise<{ synced: string[]; errors:
     try {
       if (getRulesetBySlug(slug)) continue;
       const raw = await readFile(path.join(RULESETS_DIR, file), "utf8");
-      const blueprint = parseBlueprint(JSON.parse(raw));
+      const blueprint = parseAnyBlueprint(JSON.parse(raw));
       const sourceMd = await readFile(path.join(RULESETS_DIR, `${slug}.md`), "utf8").catch(() => "");
       upsertRuleset({
         slug,

@@ -32,6 +32,24 @@ function wait(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Rehearsal knob: a faster tick than 40 ms, so long-stream behaviour can be tested. */
+const CHUNK_DELAY_MS = Number(process.env.MOCK_CHUNK_DELAY_MS ?? 40);
+
+/**
+ * Rehearsal knob: pad the audience note to N characters.
+ *
+ * Long reasoning is exactly where the live feed used to degrade, so the local
+ * rehearsal provider has to be able to produce it — otherwise that path only gets
+ * exercised by a real (slow, expensive) model.
+ */
+function padThinking(text: string, target = Number(process.env.MOCK_THINK_CHARS ?? 0)): string {
+  if (!Number.isFinite(target) || target <= text.length) return text;
+  const filler = "它上一轮的让步是有条件的，这一手我得把条件重新摆一遍。";
+  let out = text;
+  while (out.length < target) out += filler;
+  return out.slice(0, target);
+}
+
 function pick<T>(arr: T[], h: number): T {
   return arr[(h >>> 0) % arr.length];
 }
@@ -75,6 +93,111 @@ export const mock: ProviderAdapter = {
     const user = req.messages[req.messages.length - 1]?.content ?? "";
     const promptTokens = Math.ceil((system.length + user.length) / 2.6);
     const h = fnv1a(`${user.slice(-300)}|${system.slice(0, 200)}`);
+
+    /* ── werewolf: post-game review ballot ── */
+    // Review calls are forms, not seat turns: the answer is one strict JSON
+    // ballot. Keep this branch before the seat-turn branch so a prompt that
+    // mentions the table name still lands here.
+    if (system.includes("赛后复盘") || system.includes("赛后评分")) {
+      const rnd = mulberry32(fnv1a(`${user.slice(-600)}|${system.slice(0, 160)}`));
+      const score = () => 4 + Math.floor(rnd() * 6);
+      const pick = () => 1 + Math.floor(rnd() * 9);
+      const scores = Array.from({ length: 9 }, (_, seat) => ({
+        seat: seat + 1,
+        read: score(),
+        voice: score(),
+        craft: score(),
+        poise: score(),
+        comment: `演练场评分：${seat + 1} 号。`,
+      }));
+      const body = JSON.stringify({
+        scores,
+        mvp: pick(),
+        bestSpeech: pick(),
+        bestDeception: pick(),
+        summary: "演练场自动评分，仅用于流程验证。",
+      });
+      for (const chunk of body.match(/[\s\S]{1,24}/g) ?? []) {
+        onDelta({ text: chunk });
+        await wait(10);
+      }
+      return {
+        text: body,
+        thinking: "",
+        usage: { promptTokens, completionTokens: Math.ceil(body.length / 2.6) },
+        latencyMs: Date.now() - started,
+      };
+    }
+
+    /* ── werewolf: judge deal ── */
+    if (system.includes("只负责开局发牌")) {
+      const deck = ["wolf", "wolf", "wolf", "villager", "villager", "villager", "seer", "witch", "hunter"];
+      const rnd = mulberry32(fnv1a(user));
+      for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+      }
+      const body = JSON.stringify({ deal: deck.map((role, i) => ({ seat: i + 1, role })) });
+      for (const chunk of body.match(/[\s\S]{1,24}/g) ?? []) {
+        onDelta({ text: chunk });
+        await wait(10);
+      }
+      return {
+        text: body,
+        thinking: "",
+        usage: { promptTokens, completionTokens: Math.ceil(body.length / 2.6) },
+        latencyMs: Date.now() - started,
+      };
+    }
+
+    /* ── werewolf: one seat turn ── */
+    if (system.includes("九人局") || system.includes("预女猎")) {
+      const targetLine = user.match(/## 本轮可选目标\n([^\n]+)/)?.[1] ?? "";
+      const targets = [...targetLine.matchAll(/(\d+)号/g)].map((m) => Number(m[1]));
+      const target = targets.length ? targets[h % targets.length] : 1;
+      // The public chronicle can contain the words "遗言" or "投票"; branch on the
+      // phase header only, never on the whole transcript. The header is no longer
+      // the first line (the chronicle leads the prompt now), so find it by shape.
+      const head = user.match(/^第 \d+ 天 · ([^\n。]+)。/m)?.[1] ?? "";
+      let body: string;
+      let note: string;
+      if (head.includes("狼人行动") || head.includes("狼人定刀")) {
+        body = JSON.stringify({ target, talk: "听我的，先刀他。" });
+        note = `刀口先压在 ${target} 号。他白天太会带节奏，留着迟早把票烧到我们身上；今晚试这一刀，明天我装作什么都不知道。`;
+      } else if (head.includes("预言家验人")) {
+        body = JSON.stringify({ target });
+        note = `我验 ${target} 号：他上一轮的解释绕开了最关键的一句。验出狼，明天我就把这条线拎出来；验出好人，至少能少一个错票。`;
+      } else if (head.includes("女巫用药")) {
+        body = JSON.stringify({ action: "none", target: null });
+        note = "药只有两瓶，这一刀还不值得我暴露。先按住，等一个能救到关键位、或者毒到狼的夜里再动。";
+      } else if (head.includes("猎人开枪")) {
+        body = JSON.stringify({ target: "pass" });
+        note = "枪先按住。现在翻牌只会替狼指路，我把这一枪留到有人露出破绽的时候。";
+      } else if (head.includes("遗言")) {
+        body = JSON.stringify({ speech: "我没什么好说的，好人自己盘。" });
+        note = "我带不走的东西太多了。只希望好人明天先看那些急着替我收尾的人。";
+      } else if (head.includes("投票") || head.includes("重投")) {
+        body = JSON.stringify({ vote: targets.length ? target : "弃票" });
+        note = `我把票压在 ${target} 号：他刚才那句解释绕开了最要命的一问。先推他，错了明天再算账。`;
+      } else {
+        body = JSON.stringify({ speech: `我先听一圈，${target}号先说。` });
+        note = `这一轮我不抢头香。先让 ${target} 号把话说满，我再决定是顺着推，还是把水搅浑。`;
+      }
+      const thinking = note;
+      const script = `<<<THINK>>>\n${thinking}\n<<<SUBMIT>>>\n${body}`;
+      let text = "";
+      for (const chunk of script.match(/[\s\S]{1,18}/g) ?? []) {
+        text += chunk;
+        onDelta({ text: chunk });
+        await wait(CHUNK_DELAY_MS);
+      }
+      return {
+        text,
+        thinking: "",
+        usage: { promptTokens, completionTokens: Math.ceil(text.length / 2.6) },
+        latencyMs: Date.now() - started,
+      };
+    }
 
     /* ── compiler branch ── */
     if (system.includes("对局规则的编译器")) {
@@ -210,18 +333,20 @@ export const mock: ProviderAdapter = {
     }
     if (slots.length === 0) content.move = "观望";
 
-    const thinking = `${pick(OPENERS, h)}（${side} 第 ${round} 轮：${
-      Object.entries(content)
-        .map(([k, v]) => `${k}=${v}`)
-        .join("，") || "无槽位"
-    }）`;
+    const thinking = padThinking(
+      `${pick(OPENERS, h)}（${side} 第 ${round} 轮：${
+        Object.entries(content)
+          .map(([k, v]) => `${k}=${v}`)
+          .join("，") || "无槽位"
+      }）`,
+    );
     const script = `<<<THINK>>>\n${thinking}\n<<<SUBMIT>>>\n${JSON.stringify(content)}`;
 
     let text = "";
     for (const chunk of script.match(/[\s\S]{1,18}/g) ?? []) {
       text += chunk;
       onDelta({ text: chunk });
-      await wait(40);
+      await wait(CHUNK_DELAY_MS);
     }
 
     return {

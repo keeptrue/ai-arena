@@ -1,4 +1,18 @@
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 13;
+
+/**
+ * One row per live match: the state the reducer needs to pick the match back up
+ * after the process died. Written before any model call is dispatched, dropped
+ * when the match finishes — it is a crash checkpoint, not a second source of truth.
+ */
+export const CHECKPOINT_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS match_checkpoints (
+  match_id     TEXT PRIMARY KEY REFERENCES matches(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+`;
 
 /**
  * Global prompt overrides. One row per edited template; a missing key means the
@@ -36,6 +50,9 @@ CREATE TABLE IF NOT EXISTS models (
   supports_reasoning INTEGER NOT NULL DEFAULT 0,
   reasoning_effort   TEXT,
   thinking_budget    INTEGER,
+  call_timeout_ms    INTEGER,
+  -- auto = the endpoint matches prefixes itself; explicit = we mark breakpoints.
+  provider_cache_mode TEXT,
   card_json          TEXT,
   in_contender_pool  INTEGER NOT NULL DEFAULT 1,
   in_judge_pool      INTEGER NOT NULL DEFAULT 1,
@@ -69,6 +86,8 @@ CREATE TABLE IF NOT EXISTS matches (
   judge_json              TEXT,
   calls_used              INTEGER NOT NULL DEFAULT 0,
   tokens_used             INTEGER NOT NULL DEFAULT 0,
+  -- The slice of tokens_used that a prefix cache served; a subset, never a total.
+  cached_tokens           INTEGER NOT NULL DEFAULT 0,
   winner_team_id          TEXT,
   end_reason              TEXT,
   created_at              INTEGER NOT NULL,
@@ -141,6 +160,7 @@ CREATE INDEX IF NOT EXISTS idx_events_match_seq ON events(match_id, seq);
 CREATE INDEX IF NOT EXISTS idx_submissions_match ON submissions(match_id, round);
 
 ${PROMPT_TABLE_SQL}
+${CHECKPOINT_TABLE_SQL}
 `;
 
 /** Tables from the numeric-combat era; dropped on upgrade. */
@@ -172,6 +192,15 @@ export const MOCK_MODELS: Array<{
   { id: "m-mock-b", providerId: "mock", modelId: "rehearsal-b", display: "演练体 B" },
   { id: "m-mock-c", providerId: "mock", modelId: "rehearsal-c", display: "演练体 C" },
   { id: "m-mock-d", providerId: "mock", modelId: "rehearsal-d", display: "演练体 D" },
+  { id: "m-mock-e", providerId: "mock", modelId: "rehearsal-e", display: "演练体 E" },
+  { id: "m-mock-f", providerId: "mock", modelId: "rehearsal-f", display: "演练体 F" },
+  { id: "m-mock-g", providerId: "mock", modelId: "rehearsal-g", display: "演练体 G" },
+  { id: "m-mock-h", providerId: "mock", modelId: "rehearsal-h", display: "演练体 H" },
+  { id: "m-mock-i", providerId: "mock", modelId: "rehearsal-i", display: "演练体 I" },
+  // Ten bodies: a full nine-seat table needs one more model for the post-game
+  // judge chair. A seat may also judge, but the rehearsal cast keeps ten so both
+  // roles can be exercised without reusing a model.
+  { id: "m-mock-j", providerId: "mock", modelId: "rehearsal-j", display: "演练体 J" },
 ];
 
 /** Removed in schema v4: models now appear as themselves, with no role-play card. */

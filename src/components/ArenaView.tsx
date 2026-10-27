@@ -1,17 +1,19 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ArenaEvent, BoardSpec, ModelSnapshot } from "@/engine/types";
-import { foldBoard } from "@/lib/board";
-import { BoardStrip } from "./arena-board";
-import { EffortChip } from "./arena-blocks";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ArenaEvent, BoardSpec, ModelSnapshot, Settlement } from "@/engine/types";
+import { boardSeries, foldBoard } from "@/lib/board";
+import { clearPin, pinPhaseLabel, publishPin, type MatchPin } from "@/lib/pin";
+import { ArenaScoreboard } from "./arena-board";
+import { EffortChip, LiveStream } from "./arena-blocks";
 import {
   DmPanel,
   RoundCard,
   TeamColumn,
   type RoundView,
   type SlotDef,
+  type TeamIndex,
   type TeamView,
 } from "./arena-parts";
 
@@ -35,6 +37,12 @@ interface JudgeInfo {
   budget?: number | null;
 }
 
+interface ReconciledRound {
+  settlement: Settlement;
+  scores: NonNullable<RoundView["verdict"]>["scores"];
+  teamScores: Record<string, number>;
+}
+
 interface ViewState {
   meta: Meta | null;
   teams: TeamView[];
@@ -54,8 +62,14 @@ interface ViewState {
   } | null;
   dm: Array<{ kind: string; text?: string }>;
   anomalies: Array<{ code: string; seat?: number; message?: string }>;
+  /** round → corrected ledger + scores appended by `scripts/repair-board.ts`. */
+  reconciled: Record<number, ReconciledRound>;
   notFound: boolean;
 }
+
+/** Stable identities for the "nothing here" cases: props must not churn per render. */
+const EMPTY_SLOTS: SlotDef[] = [];
+const EMPTY_DIMENSIONS: Array<{ key: string; label: string; weight: number }> = [];
 
 const EMPTY: ViewState = {
   meta: null,
@@ -70,6 +84,7 @@ const EMPTY: ViewState = {
   finish: null,
   dm: [],
   anomalies: [],
+  reconciled: {},
   notFound: false,
 };
 
@@ -84,9 +99,10 @@ function mapMember(m: any, roster: Record<string, ModelSnapshot>): TeamView["mem
     kind: snap?.kind ?? null,
     temperature: snap?.temperature ?? null,
     thinkingBudget: snap?.thinkingBudget ?? null,
+    callTimeoutMs: snap?.callTimeoutMs ?? null,
     reasoning: snap?.reasoningEffort ?? m.reasoning ?? null,
     status: "idle",
-    thinking: [],
+    thinking: "",
     thinkingDone: false,
     content: null,
     usage: null,
@@ -100,13 +116,15 @@ function withMember(
   participantId: string,
   patch: (m: TeamView["members"][number]) => TeamView["members"][number],
 ): ViewState {
-  return {
-    ...state,
-    teams: state.teams.map((t) => ({
-      ...t,
-      members: t.members.map((m) => (m.id === participantId ? patch(m) : m)),
-    })),
-  };
+  let touched = false;
+  const teams = state.teams.map((t) => {
+    if (!t.members.some((m) => m.id === participantId)) return t;
+    touched = true;
+    return { ...t, members: t.members.map((m) => (m.id === participantId ? patch(m) : m)) };
+  });
+  // Untouched teams (and their members) keep their identity, so memoised cards only
+  // repaint the seat that actually emitted. Without this every delta rebuilt the roster.
+  return touched ? { ...state, teams } : state;
 }
 
 function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
@@ -150,7 +168,7 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
           members: t.members.map((m) => ({
             ...m,
             status: "idle" as const,
-            thinking: [],
+            thinking: "",
             thinkingDone: false,
             content: null,
             usage: null,
@@ -166,7 +184,9 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
       return withMember(state, id, (m) => ({
         ...m,
         status: m.status === "ready" || m.status === "forfeit" ? m.status : "thinking",
-        thinking: [...m.thinking, p.delta as string],
+        // Append, never rebuild: the array-spread version allocated a new list per
+        // delta and made every consumer re-join the whole text on every render.
+        thinking: m.thinking + (typeof p.delta === "string" ? p.delta : ""),
       }));
     }
 
@@ -176,7 +196,7 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
         ...m,
         status: "ready",
         content: (p.content ?? {}) as Record<string, unknown>,
-        thinking: p.thinking ? [p.thinking as string] : m.thinking,
+        thinking: typeof p.thinking === "string" && p.thinking ? p.thinking : m.thinking,
         thinkingDone: true,
         usage: (p.usage as { promptTokens: number; completionTokens: number }) ?? null,
         latencyMs: typeof p.latencyMs === "number" ? p.latencyMs : null,
@@ -190,6 +210,20 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
         status: "forfeit",
         thinkingDone: true,
         forfeitReason: typeof p.reason === "string" ? p.reason : null,
+      }));
+    }
+
+    // A seat was handed its turn back: it is thinking again, and the strike is gone.
+    case "seat.recalled": {
+      const id = p.participantId as string;
+      if (!id) return state;
+      return withMember(state, id, (m) => ({
+        ...m,
+        status: "thinking",
+        thinking: "",
+        thinkingDone: false,
+        forfeitReason: null,
+        content: null,
       }));
     }
 
@@ -240,6 +274,26 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
           judge: p.judge ?? "",
           marks: (p.marks as number[] | undefined) ?? [],
           suddenWinnerTeamId: p.suddenWinnerTeamId ?? null,
+          blindMap: (p.blindMap as Record<string, string> | undefined) ?? undefined,
+        },
+      };
+    }
+
+    case "board.reconciled": {
+      // Appended by the repair script: the ledger outranks what the judge wrote,
+      // and totals are re-derived from these corrected round scores.
+      const round = Number(p.round);
+      const settlement = p.settlement as Settlement | undefined;
+      if (!Number.isFinite(round) || !settlement) return state;
+      return {
+        ...state,
+        reconciled: {
+          ...state.reconciled,
+          [round]: {
+            settlement,
+            scores: (p.scores ?? []) as ReconciledRound["scores"],
+            teamScores: (p.teamScores ?? {}) as Record<string, number>,
+          },
         },
       };
     }
@@ -261,10 +315,11 @@ function applyEvent(state: ViewState, event: ArenaEvent): ViewState {
             latencyMs: m.latencyMs ?? null,
             status: m.status === "forfeit" ? "forfeit" : "ready",
             content: m.content ?? {},
-            thinking: m.thinking.join(""),
+            thinking: m.thinking,
           })),
         ),
         verdict,
+        settlement: p.settlement ?? null,
         judgeThinking: state.judgeChunks.join(""),
         teamScores: (p.teamScores ?? {}) as Record<string, number>,
       };
@@ -309,6 +364,13 @@ export function ArenaView({ matchId }: { matchId: string }) {
   const pending = useRef<ArenaEvent[]>([]);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showDm, setShowDm] = useState(true);
+  const baseTitle = useRef<string | null>(null);
+  // Is anything driving this match, and is there a checkpoint to rewind to?
+  const [link, setLink] = useState<{ live: boolean; resumable: boolean }>({ live: true, resumable: false });
+  // Why a recall was refused (the engine, not the button, decides when it is legal).
+  const [recallNote, setRecallNote] = useState<string | null>(null);
+  // Bumping this re-runs boot: a recovery has to re-read the log and reopen the stream.
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -341,6 +403,8 @@ export function ArenaView({ matchId }: { matchId: string }) {
           roster?: { participants: Array<{ id: string; model: ModelSnapshot }> };
           judge?: ModelSnapshot | null;
           events: ArenaEvent[];
+          live?: boolean;
+          resumable?: boolean;
         };
         if (cancelled) return;
         const roster: Record<string, ModelSnapshot> = {};
@@ -356,9 +420,13 @@ export function ArenaView({ matchId }: { matchId: string }) {
           : null;
         setView((v) => ({ ...v, roster, judge }));
         enqueue(data.events);
-        if (["finished", "failed", "aborted", "interrupted"].includes(data.match.status)) return;
+        setLink({ live: data.live !== false, resumable: data.resumable === true });
+        if (["finished", "failed", "aborted"].includes(data.match.status)) return;
 
         source = new EventSource(`/api/matches/${matchId}/stream?after=${lastSeq.current}`);
+        // A restarted server reconnects the stream silently; re-read the truth so the
+        // page stops claiming a dead match is still collecting.
+        source.onopen = () => void refreshLink();
         source.onmessage = (ev) => {
           try {
             enqueue([JSON.parse(ev.data) as ArenaEvent]);
@@ -377,28 +445,174 @@ export function ArenaView({ matchId }: { matchId: string }) {
       if (timer.current != null) clearTimeout(timer.current);
       source?.close();
     };
-  }, [matchId]);
+  }, [matchId, reload]);
+
+  async function recover() {
+    try {
+      const res = await fetch(`/api/matches/${matchId}/recover`, { method: "POST" });
+      const data = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !data.ok) return;
+      setReload((n) => n + 1);
+    } catch {
+      /* the DM panel keeps its own toast */
+    }
+  }
+
+  /**
+   * Hand a seat its turn back after a cut that produced nothing. The engine, not
+   * the button, decides legality: a judged round comes back refused with a reason.
+   */
+  const recall = useCallback(
+    async (participantId: string) => {
+      setRecallNote(null);
+      try {
+        const res = await fetch(`/api/matches/${matchId}/intervene`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind: "recall", participantId }),
+        });
+        const data = (await res.json()) as { ok?: boolean; error?: string; code?: string };
+        if (!res.ok || !data.ok) throw new Error(data.error ?? "补叫失败");
+      } catch (err) {
+        setRecallNote(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [matchId],
+  );
+
+  /** Cheap status read: live / resumable, one event at most. */
+  async function refreshLink() {
+    try {
+      const res = await fetch(`/api/matches/${matchId}?after=${lastSeq.current}&limit=1`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { live?: boolean; resumable?: boolean };
+      setLink({ live: data.live !== false, resumable: data.resumable === true });
+    } catch {
+      /* keep the last known state */
+    }
+  }
 
   const teams = view.teams;
-  const slots = view.meta?.slots ?? [];
+  // `?? []` allocates a fresh array every render, which silently defeats memo on
+  // every child that receives it. Module-level empties keep the props stable.
+  const slots = view.meta?.slots ?? EMPTY_SLOTS;
   const totalSeats = teams.reduce((n, t) => n + t.members.length, 0);
   const settled = teams.reduce(
     (n, t) => n + t.members.filter((m) => m.status === "ready" || m.status === "forfeit").length,
     0,
   );
   const winner = teams.find((t) => t.id === view.finish?.winnerTeamId);
+  // Dead, but not settled: nobody is driving this match any more.
+  const stalled = !link.live && view.phase !== "done" && view.phase !== "connecting";
 
   const cols = useMemo(() => Math.max(1, teams.length), [teams.length]);
 
   const board = view.meta?.board ?? null;
   const teamKey = teams.map((t) => t.id).join(",");
+  const teamIds = useMemo(() => (teamKey ? teamKey.split(",") : []), [teamKey]);
+
+  // A repaired round replaces the judge's numbers with the ledger's. Resolving it once
+  // keeps the board, the trend, the cards and the totals on the same history.
+  const displayHistory = useMemo(() => {
+    if (Object.keys(view.reconciled).length === 0) return view.history;
+    return view.history.map((r) => {
+      const rec = view.reconciled[r.round];
+      if (!rec) return r;
+      return {
+        ...r,
+        settlement: rec.settlement,
+        teamScores: rec.teamScores,
+        verdict: r.verdict ? { ...r.verdict, scores: rec.scores } : r.verdict,
+      };
+    });
+  }, [view.history, view.reconciled]);
+
   const boardSnapshot = useMemo(
-    () => foldBoard(board ?? undefined, teamKey ? teamKey.split(",") : [], view.history),
-    [board, teamKey, view.history],
+    () => foldBoard(board ?? undefined, teamIds, displayHistory),
+    [board, teamIds, displayHistory],
   );
-  const boardMarks = view.history.length
-    ? (view.history[view.history.length - 1].verdict?.marks ?? [])
-    : [];
+  const boardTrend = useMemo(
+    () => boardSeries(board ?? undefined, teamIds, displayHistory),
+    [board, teamIds, displayHistory],
+  );
+
+  // Totals come from the runtime, plus whatever a repaired round changed.
+  const adjustedTotals = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const t of teams) {
+      let total = t.total;
+      for (const r of view.history) {
+        const rec = view.reconciled[r.round];
+        if (!rec) continue;
+        total += (rec.teamScores[t.id] ?? 0) - (r.teamScores[t.id] ?? 0);
+      }
+      out[t.id] = Number(total.toFixed(3));
+    }
+    return out;
+  }, [teams, view.history, view.reconciled]);
+
+  const teamsView = useMemo(
+    () => teams.map((t) => ({ ...t, total: adjustedTotals[t.id] ?? t.total })),
+    [teams, adjustedTotals],
+  );
+
+  // Team names and colours are frozen at match creation, so this table is stable for
+  // the whole match: history cards can skip re-rendering while a seat streams.
+  const teamIndex = useMemo(() => {
+    const out: TeamIndex = {};
+    for (const t of teams) out[t.id] = { name: t.name, color: t.color };
+    return out;
+  }, [teamKey]);
+  const dimensions = view.meta?.dimensions ?? EMPTY_DIMENSIONS;
+
+  // The tab bar is the other place a long match gets lost: title carries phase + round.
+  useEffect(() => {
+    if (!view.meta) return;
+    if (baseTitle.current === null) baseTitle.current = document.title;
+    document.title = `${pinPhaseLabel(view.phase)} ${view.round}/${view.meta.rounds} · ${view.meta.name} · 斗场`;
+  }, [view.meta, view.round, view.phase]);
+
+  useEffect(
+    () => () => {
+      if (baseTitle.current !== null) document.title = baseTitle.current;
+    },
+    [],
+  );
+
+  // Only the visible tab may claim the header chip: two live matches in two tabs must
+  // not overwrite each other on every delta. The pin record itself is written rarely
+  // (round / phase / seat changes), never per thinking chunk.
+  const sighting = useMemo<MatchPin | null>(() => {
+    if (!view.meta) return null;
+    return {
+      id: matchId,
+      kind: "rubric",
+      name: view.meta.name,
+      phase: view.phase,
+      round: view.round,
+      rounds: view.meta.rounds,
+      settled,
+      seats: totalSeats,
+      ts: Date.now(),
+    };
+  }, [matchId, view.meta, view.phase, view.round, settled, totalSeats]);
+
+  useEffect(() => {
+    if (!sighting) return;
+    const publish = () => {
+      if (document.visibilityState === "visible") publishPin(sighting);
+    };
+    publish();
+    document.addEventListener("visibilitychange", publish);
+    return () => document.removeEventListener("visibilitychange", publish);
+  }, [sighting]);
+
+  // A deleted match must not leave a chip pointing at nothing.
+  useEffect(() => {
+    if (view.notFound) clearPin(matchId);
+  }, [view.notFound, matchId]);
 
   if (view.notFound) {
     return (
@@ -423,6 +637,11 @@ export function ArenaView({ matchId }: { matchId: string }) {
           <div className="flex items-center gap-3">
             <h1 className="truncate text-[20px] font-semibold tracking-tight">{view.meta?.name ?? "对局"}</h1>
             <StatusChip phase={view.phase} />
+            {stalled && (
+              <span className="rounded border border-amber/30 bg-amber/10 px-2 py-0.5 text-[10px] text-amber">
+                已中断
+              </span>
+            )}
           </div>
           <p className="mt-1 truncate text-[13px] text-fg-dim">{view.meta?.tagline}</p>
           <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[12px]">
@@ -455,12 +674,31 @@ export function ArenaView({ matchId }: { matchId: string }) {
         </div>
       </header>
 
+      {stalled && (
+        <div className="panel mb-4 border-amber/30 px-3 py-2 text-[12px] text-amber">
+          <p>
+            第 {view.round} 轮停在「{pinPhaseLabel(view.phase)}」：进程重启后没人推进。
+          </p>
+          {link.resumable ? (
+            <p className="mt-0.5">点 DM 面板的「从断点继续」，只会补叫还没交卷的座位。</p>
+          ) : (
+            <p className="mt-0.5 text-fg-faint">
+              这一局没有断点（建于断点功能之前，或断点写入失败），只能当回放看。
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="mb-4 h-[2px] w-full overflow-hidden rounded bg-ink-3">
         <div
           className="h-full rounded bg-jade/70 transition-[width] duration-500"
           style={{ width: `${totalSeats ? (settled / totalSeats) * 100 : 0}%` }}
         />
       </div>
+
+      {recallNote && (
+        <div className="panel mb-4 border-amber/30 px-3 py-2 text-[12px] text-amber">{recallNote}</div>
+      )}
 
       {view.finish && (
         <div className="panel mb-4 flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
@@ -472,7 +710,7 @@ export function ArenaView({ matchId }: { matchId: string }) {
             {reasonLabel(view.finish.reason)} · 共 {view.finish.rounds} 轮
           </span>
           <span className="mono ml-auto text-[11px] text-fg-faint">
-            {[...teams]
+            {[...teamsView]
               .sort((a, b) => b.total - a.total)
               .map((t) => `${t.name} ${t.total.toFixed(2)}`)
               .join("   ")}
@@ -481,13 +719,15 @@ export function ArenaView({ matchId }: { matchId: string }) {
       )}
 
       {board && teams.length > 0 && (
-        <BoardStrip
+        <ArenaScoreboard
           board={board}
           teams={teams.map((t) => ({ id: t.id, name: t.name, color: t.color }))}
           values={boardSnapshot.values}
-          stale={boardSnapshot.stale}
+          series={boardTrend.points}
+          missing={boardTrend.missing}
           round={boardSnapshot.round}
-          marks={boardMarks}
+          rounds={view.meta?.rounds ?? 0}
+          stale={boardSnapshot.stale}
         />
       )}
 
@@ -498,8 +738,15 @@ export function ArenaView({ matchId }: { matchId: string }) {
           className="grid gap-3 grid-cols-1 lg:[grid-template-columns:repeat(var(--cols),minmax(0,1fr))]"
           style={{ ["--cols" as string]: cols }}
         >
-          {teams.map((t) => (
-            <TeamColumn key={t.id} team={t} slots={slots} round={view.round} />
+          {teamsView.map((t) => (
+            <TeamColumn
+              key={t.id}
+              team={t}
+              slots={slots}
+              round={view.round}
+              live={!stalled}
+              onRecall={!stalled && view.phase === "collecting" ? recall : undefined}
+            />
           ))}
         </div>
       )}
@@ -516,28 +763,26 @@ export function ArenaView({ matchId }: { matchId: string }) {
               第一轮还在场上，等所有人交齐。
             </p>
           )}
-          {[...view.history].reverse().map((r) => {
-            const idx = view.history.findIndex((x) => x.round === r.round);
-            const prev = idx > 0 ? view.history[idx - 1] : null;
+          {[...displayHistory].reverse().map((r) => {
+            const idx = displayHistory.findIndex((x) => x.round === r.round);
+            const prev = idx > 0 ? displayHistory[idx - 1] : null;
             return (
               <RoundCard
                 key={r.round}
                 record={r}
-                teams={teams}
+                teamIndex={teamIndex}
                 slots={slots}
-                dimensions={view.meta?.dimensions ?? []}
+                dimensions={dimensions}
                 board={board}
                 prevScores={prev?.verdict?.scores ?? null}
+                repaired={Boolean(view.reconciled[r.round])}
               />
             );
           })}
 
           {view.judgeChunks.length > 0 && !view.finish && (
             <article className="panel px-4 py-3">
-              <div className="label mb-1.5">裁判推演</div>
-              <p className="mono whitespace-pre-wrap text-[11px] leading-relaxed text-fg-dim/80">
-                {view.judgeChunks.join("")}
-              </p>
+              <LiveStream chunks={view.judgeChunks} label="裁判推演" />
             </article>
           )}
         </section>
@@ -546,9 +791,11 @@ export function ArenaView({ matchId }: { matchId: string }) {
           <aside className="min-w-0 space-y-3 lg:sticky lg:top-20 lg:self-start">
             <DmPanel
               matchId={matchId}
-              teams={teams}
+              teams={teamsView}
               paused={view.phase === "paused"}
               disabled={view.phase === "done"}
+              resumable={link.resumable}
+              onRecover={() => void recover()}
             />
 
             {view.dm.length > 0 && (

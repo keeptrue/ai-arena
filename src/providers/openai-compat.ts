@@ -15,7 +15,15 @@ interface OaiDelta {
 }
 interface OaiChunk {
   choices?: Array<{ delta?: OaiDelta; finish_reason?: string | null }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    /** OpenAI / OpenRouter: the cached slice of `prompt_tokens`. */
+    prompt_tokens_details?: { cached_tokens?: number } | null;
+    /** DeepSeek: spelled out at the top level. */
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+  } | null;
   error?: { message?: string };
 }
 
@@ -30,7 +38,11 @@ export const openaiCompat: ProviderAdapter = {
     const cap = req.maxTokens;
     const body: Record<string, unknown> = {
       model: req.model.modelId,
-      messages: [{ role: "system", content: req.system }, ...req.messages],
+      // Map explicitly: `cacheAt` is our own field and must never reach the wire.
+      messages: [
+        { role: "system", content: req.system },
+        ...req.messages.map((m) => ({ role: m.role, content: m.content })),
+      ],
       stream: true,
       stream_options: { include_usage: true },
     };
@@ -61,10 +73,14 @@ export const openaiCompat: ProviderAdapter = {
     let thinking = "";
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedPromptTokens = 0;
     let streamError: string | null = null;
 
     await readSse(res.body, (data) => {
       if (data === "[DONE]") return;
+      // Any frame the server bothered to send proves the stream is alive, even
+      // when it carries only `role`, an empty delta or a usage tally.
+      req.onBeat?.();
       let chunk: OaiChunk;
       try {
         chunk = JSON.parse(data) as OaiChunk;
@@ -91,8 +107,13 @@ export const openaiCompat: ProviderAdapter = {
       if (chunk.usage) {
         promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
         completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+        // Either shape counts towards the same thing: the slice of the input the
+        // provider served from its own prefix cache.
+        const hit =
+          chunk.usage.prompt_tokens_details?.cached_tokens ?? chunk.usage.prompt_cache_hit_tokens ?? 0;
+        if (hit > 0) cachedPromptTokens = hit;
       }
-    });
+    }, req.onBeat);
 
     if (streamError) throw new Error(`${req.model.providerName}: ${streamError}`);
     if (!text && !thinking) throw new Error(`${req.model.providerName}: empty stream`);
@@ -103,6 +124,7 @@ export const openaiCompat: ProviderAdapter = {
       usage: {
         promptTokens: promptTokens || estimateTokens(req.system + req.messages.map((m) => m.content).join("")),
         completionTokens: completionTokens || estimateTokens(text + thinking),
+        cachedPromptTokens,
       },
       latencyMs: Date.now() - started,
     };
