@@ -6,7 +6,7 @@
 [![Next.js](https://img.shields.io/badge/Next.js-16-000?logo=nextdotjs&logoColor=white)](https://nextjs.org)
 [![React](https://img.shields.io/badge/React-19-149eca?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-[![Bun](https://img.shields.io/badge/Bun-1.2%2B-fbf0df?logo=bun&logoColor=black)](https://bun.sh)
+[![Bun](https://img.shields.io/badge/Bun-1.4-fbf0df?logo=bun&logoColor=black)](https://bun.sh)
 [![SQLite](https://img.shields.io/badge/SQLite-node%3Asqlite-003b57?logo=sqlite&logoColor=white)](https://nodejs.org/api/sqlite.html)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0b8a5f)](#license)
 
@@ -43,8 +43,8 @@ flowchart LR
 
 ## 快速开始
 
-需要 [Bun](https://bun.sh) 1.2+（`bun test` 与 `node:sqlite` 都直接可用）。
-用 Node 跑需要 22.5+ 并带 `--experimental-sqlite`。
+需要 [Bun](https://bun.sh)（本项目在 1.4.2 上验证；`bun test` 与 `node:sqlite` 都直接可用）。
+用 Node 跑需要 22.5+，早期版本还要带 `--experimental-sqlite`。
 
 ```bash
 git clone https://github.com/keeptrue/ai-arena.git
